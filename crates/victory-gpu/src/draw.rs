@@ -144,6 +144,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -274,7 +275,10 @@ impl State {
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            {
+                crate::capture::note_target(record.resource);
+                trace_texture_binding(list, record.resource, "RTV");
+            }
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -371,6 +375,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +394,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -482,6 +488,10 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                #[cfg(feature = "diagnostics")]
+                if compute && Self::dispatch_capture_shader() == Some(stage.shader.hash.as_str()) {
+                    self.trace_dispatch_slots(list, &t.used, &made);
+                }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -532,21 +542,177 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::trace_compute_rejection(list, self.pipeline as This, "direct: no host pipeline");
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        #[cfg(feature = "diagnostics")]
+        list.begin_dispatch_trace();
+        #[cfg(feature = "diagnostics")]
+        let argument_mark = list.mark_argument_writer();
+        let bound = self.bind(list, p, true);
+        #[cfg(feature = "diagnostics")]
+        let uavs = list.end_dispatch_trace();
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::trace_compute_rejection(list, self.pipeline as This, "direct: descriptor binding failed");
             return;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let snapshots = Self::dispatch_snapshots(p, &uavs);
+        #[cfg(feature = "diagnostics")]
+        if let Some(&(_, frame, 0)) = snapshots.first() {
+            self.snapshot_dispatch_inputs(list, p, frame);
+        }
+        #[cfg(feature = "diagnostics")]
+        Self::snapshot_dispatch(list, &snapshots, "before");
+        #[cfg(feature = "diagnostics")]
+        let writers = argument_mark.map_or_else(Vec::new, |mark| list.argument_writer_targets(mark));
+        #[cfg(feature = "diagnostics")]
+        let snapshot_writers = |phase| {
+            if let Some(stage) = p.stages.first() {
+                let shader = &stage.shader.hash;
+                if let (Some(mark), Some((_, _, index))) = (argument_mark, writers.first()) {
+                    list.snapshot_argument_writer_buffers(mark, shader, *index, phase);
+                }
+                for (shadow, argument, index) in &writers {
+                    list.snapshot_indirect(&shadow.buffer, shadow.offset(*argument as u64), 12,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format!("writer-{shader}-{index}-{argument:x}-{phase}"));
+                }
+            }
+        };
+        #[cfg(feature = "diagnostics")]
+        if !writers.is_empty() {
+            let operation = self.op_text(format!("dispatch {x}x{y}x{z}"), true);
+            tracing::info!(list = ?std::ptr::from_ref(list), %operation, "recorded direct argument writer candidate");
+            snapshot_writers("before");
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        snapshot_writers("after");
+        #[cfg(feature = "diagnostics")]
+        Self::snapshot_dispatch(list, &snapshots, "after");
+        #[cfg(feature = "diagnostics")]
+        self.trace_dispatch_uavs(list, &uavs, || format!("dispatch {x}x{y}x{z}"));
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch_uavs(&self, list: &HostList, uavs: &[usize], command: impl FnOnce() -> String) {
+        if uavs.is_empty() {
+            return;
+        }
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) >= 512 {
+            return;
+        }
+        let operation = self.op_text(command(), true);
+        tracing::info!(frame_hint = crate::queue::presented() + 1, list = ?std::ptr::from_ref(list),
+            uavs = %format_args!("{uavs:x?}"), %operation, "recorded texture dispatch");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn dispatch_capture_shader() -> Option<&'static str> {
+        static SHADER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        SHADER.get_or_init(|| {
+            std::env::var_os("VICTORY_CAPTURE")?;
+            std::env::var("VICTORY_CAPTURE_DISPATCH_SHADER").ok()
+        }).as_deref()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch_slots(&self, list: &HostList, used: &[UsedResource], made: &[(u8, u32)]) {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let Some(filter) = texture_binding_filter() else { return };
+        for used in used.iter().filter(|used| used.kind == ResourceType::Uav && used.root == RootType::Table) {
+            let Some(&Root::Table(table)) = self.compute.get(usize::from(used.slot)) else { continue };
+            let handle = table + u64::from(used.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(table) else { continue };
+            let Some(host) = heap.host() else { continue };
+            let Some(view) = crate::descriptor::view(handle) else { continue };
+            let placed = crate::descriptor::host::placed_texture(&view);
+            let View::Unordered(resource, _, view_desc) = placed.as_ref().unwrap_or(&view) else { continue };
+            let Some(expected) = crate::resource::host_resource(*resource as This) else { continue };
+            let desc = unsafe { expected.GetDesc() };
+            if (desc.Width, desc.Height, desc.Format.0) != *filter {
+                continue;
+            }
+            let Some(index) = made.iter().find(|entry| entry.0 == used.slot)
+                .map(|entry| entry.1 / 32 + used.table_offset_dwords / 8)
+                .or_else(|| heap.index(handle)) else { continue };
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+                let actual = host.slot_resource(index);
+                let matches = actual.as_ref().is_some_and(|resource| resource.as_raw() == expected.as_raw());
+                tracing::info!(list = ?std::ptr::from_ref(list), root = used.slot, dwords = used.table_offset_dwords,
+                    resource = format_args!("{resource:#x}"), index, populated = actual.is_some(), matches,
+                    mips = desc.MipLevels, layers = desc.DepthOrArraySize, ?view_desc,
+                    "materialized dispatch UAV slot");
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn dispatch_snapshots(pipeline: &HostPipeline, uavs: &[usize]) -> Vec<(usize, u64, u64)> {
+        static CAPTURED: AtomicU64 = AtomicU64::new(0);
+        if uavs.is_empty() {
+            return Vec::new();
+        }
+        let Some(shader) = Self::dispatch_capture_shader() else {
+            return Vec::new();
+        };
+        if !pipeline.stages.iter().any(|stage| stage.shader.hash == shader) {
+            return Vec::new();
+        }
+        let frame = crate::queue::presented() + 1;
+        uavs.iter().filter_map(|&resource| {
+            let index = CAPTURED.fetch_add(1, Ordering::Relaxed);
+            (index < 8).then_some((resource, frame, index))
+        }).collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn snapshot_dispatch_inputs(&self, list: &HostList, pipeline: &HostPipeline, frame: u64) {
+        let Some(filter) = texture_binding_filter() else { return };
+        let mut seen = Vec::new();
+        for used in pipeline.stages.iter().flat_map(|stage| &stage.translated().used) {
+            if used.root != RootType::Table || used.kind != ResourceType::Srv {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.compute.get(usize::from(used.slot)) else { continue };
+            let Some(view) = crate::descriptor::view(table + u64::from(used.table_offset_dwords) * 4) else { continue };
+            let placed = crate::descriptor::host::placed_texture(&view);
+            let View::Shader(resource, _) = placed.as_ref().unwrap_or(&view) else { continue };
+            if seen.contains(resource) {
+                continue;
+            }
+            let Some(texture) = crate::resource::host_resource(*resource as This) else { continue };
+            let desc = unsafe { texture.GetDesc() };
+            if (desc.Width, desc.Height, desc.Format.0) != *filter {
+                continue;
+            }
+            list.snapshot_texture(*resource as This, format!(
+                "dispatch-{frame}-input-s{}-{}-{resource:x}", used.slot, used.table_offset_dwords,
+            ));
+            seen.push(*resource);
+            if seen.len() == 4 {
+                break;
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn snapshot_dispatch(list: &HostList, snapshots: &[(usize, u64, u64)], phase: &str) {
+        for &(resource, frame, index) in snapshots {
+            list.snapshot_texture(resource as This, format!("dispatch-{frame}-{index}-{resource:x}-{phase}"));
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -773,6 +939,11 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn trace(&self, kind: &str, count: u32, first: u32) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
+        if crate::capture::auto_pending() && !self.targets.is_empty() {
+            tracing::debug!(target: "victory_gpu::capture", frame_hint = crate::queue::presented() + 1,
+                kind, pipeline = format_args!("{:#x}", self.pipeline), targets = ?self.targets,
+                "recorded draw targets");
+        }
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
@@ -834,6 +1005,60 @@ impl State {
         out
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn trace_selected_draw(&self, list: &HostList) -> Option<u64> {
+        static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let Some(hash) = HASH.get_or_init(|| std::env::var("VICTORY_TRACE_DRAW_SHADER").ok()) else {
+            return None;
+        };
+        let Some(pipeline) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return None;
+        };
+        if let Some(stage) = pipeline.stages.iter().find(|stage| &stage.shader.hash == hash) {
+            let index = LOGGED.fetch_add(1, Ordering::Relaxed);
+            let frame = crate::queue::presented() + 1;
+            if index < 32 {
+                tracing::info!(frame_hint = frame, hash,
+                    pipeline = format_args!("{:#x}", self.pipeline), targets = ?self.targets,
+                    reads = ?self.reads(false), "selected direct draw prepared");
+            }
+            if index == 0 {
+                let mut inputs = Vec::new();
+                for used in &stage.translated().used {
+                    if let (RootType::Table, Some(Root::Table(table))) =
+                        (used.root, self.roots_ref(false).get(usize::from(used.slot)))
+                        && let Some(View::Shader(resource, _)) = crate::descriptor::view(
+                            table + u64::from(used.table_offset_dwords) * 4,
+                        )
+                        && !inputs.iter().any(|&(candidate, _)| candidate == resource)
+                        && let Some(texture) = crate::resource::host_resource(resource as This)
+                    {
+                        let desc = unsafe { texture.GetDesc() };
+                        if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                            && desc.SampleDesc.Count == 1
+                        {
+                            inputs.push((resource, desc.Width.saturating_mul(u64::from(desc.Height))));
+                        }
+                    }
+                }
+                inputs.sort_by_key(|&(_, pixels)| std::cmp::Reverse(pixels));
+                let inputs = inputs.into_iter().take(8).map(|(resource, _)| resource);
+                if crate::capture::draw_snapshots() {
+                    for (slot, resource) in inputs.enumerate() {
+                        list.snapshot_texture(resource as This, format!("draw-{frame}-before-input-{slot}"));
+                    }
+                    for (slot, &resource) in self.targets.iter().take(8).enumerate() {
+                        list.snapshot_texture(resource as This, format!("draw-{frame}-before-output-{slot}"));
+                    }
+                    return Some(frame);
+                }
+                crate::capture::select_inputs(frame, inputs.collect());
+            }
+        }
+        None
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -855,11 +1080,26 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let snapshot = self.trace_selected_draw(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(frame) = snapshot {
+                        for (slot, &resource) in self.targets.iter().take(8).enumerate() {
+                            list.snapshot_texture(resource as This, format!("draw-{frame}-after-output-{slot}"));
+                        }
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    for &resource in &self.targets {
+                        if trace_texture_binding(list, resource as This, "direct draw") {
+                            tracing::info!(list = ?std::ptr::from_ref(list), resource = format_args!("{resource:#x}"),
+                                pipeline = format_args!("{:#x}", self.pipeline), "recorded matching texture draw");
+                        }
+                    }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1011,6 +1251,22 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH
+            && let Some(shader) = Self::dispatch_capture_shader()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|pipeline| pipeline.stages.iter().any(|stage| stage.shader.hash == shader))
+        {
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            let index = LOGGED.fetch_add(1, Ordering::Relaxed);
+            if index < 8 {
+                let frame = crate::queue::presented() + 1;
+                crate::host::trace_indirect_argument(arguments);
+                list.snapshot_indirect(&args.buffer, args.offset(arguments), 12,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    format!("dispatch-{frame}-{index}-before-clamp-groups-{arguments:x}"));
+            }
+        }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -1018,6 +1274,10 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            list.begin_dispatch_trace();
+        }
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -1027,8 +1287,13 @@ impl State {
             },
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        let uavs = if kind == DISPATCH { list.end_dispatch_trace() } else { Vec::new() };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            #[cfg(feature = "diagnostics")]
+            if kind == DISPATCH {
+                crate::pipeline::trace_compute_rejection(list, self.pipeline as This, "indirect: prepare failed");
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1040,6 +1305,28 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        let snapshots = if kind == DISPATCH {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+                .map_or_else(Vec::new, |pipeline| Self::dispatch_snapshots(pipeline, &uavs))
+        } else {
+            Vec::new()
+        };
+        list.buffer_state(&args.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if let Some((shadow, _)) = &counter {
+            list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(&(_, frame, index)) = snapshots.first() {
+            list.snapshot_indirect(&args.buffer, args.offset(arguments), 12,
+                D3D12_RESOURCE_STATE_GENERIC_READ, format!("dispatch-{frame}-{index}-groups-{arguments:x}"));
+            if let Some((shadow, address)) = &counter {
+                list.snapshot_indirect(&shadow.buffer, shadow.offset(*address), 4, D3D12_RESOURCE_STATE_GENERIC_READ,
+                    format!("dispatch-{frame}-{index}-count-{address:x}"));
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        Self::snapshot_dispatch(list, &snapshots, "before");
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1052,8 +1339,11 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        #[cfg(feature = "diagnostics")]
+        Self::snapshot_dispatch(list, &snapshots, "after");
         if kind == DISPATCH {
+            #[cfg(feature = "diagnostics")]
+            self.trace_dispatch_uavs(list, &uavs, || format!("indirect dispatch max {max}"));
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1115,7 +1405,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
+            list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             shadow.gpu_writes(list, address, len);
+        } else {
+            list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
         }
     }
     match (view, u.kind) {
@@ -1126,6 +1419,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                 crate::texture::upload(list, *resource as This, t);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            #[cfg(feature = "diagnostics")]
+            trace_texture_binding(list, *resource as This, "SRV");
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -1141,11 +1436,42 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
+            {
+                crate::capture::note_target(*resource as This);
+                trace_texture_binding(list, *resource as This, "UAV");
+            }
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
     }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_binding_filter() -> Option<&'static (u64, u32, i32)> {
+    static FILTER: std::sync::OnceLock<Option<(u64, u32, i32)>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| {
+        let value = std::env::var("VICTORY_TRACE_UAV_TEXTURE").ok()?;
+        let (width, rest) = value.split_once('x')?;
+        let (height, format) = rest.split_once(':')?;
+        Some((width.parse().ok()?, height.parse().ok()?, format.parse().ok()?))
+    }).as_ref()
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_texture_binding(list: &HostList, resource: This, kind: &'static str) -> bool {
+    let Some(filter) = texture_binding_filter() else {
+        return false;
+    };
+    let Some(texture) = crate::resource::host_resource(resource) else { return false };
+    let desc = unsafe { texture.GetDesc() };
+    if (desc.Width, desc.Height, desc.Format.0) == *filter {
+        list.note_texture_binding(kind, resource as usize);
+        let backing = crate::resource::texture_memory(resource).map(|(address, _)| address);
+        tracing::info!(frame_hint = crate::queue::presented() + 1, list = ?std::ptr::from_ref(list),
+            kind, ?resource, ?backing, "matching texture binding");
+        return true;
+    }
+    false
 }
 
 /// A view in a few words (diagnostics builds).
@@ -1155,7 +1481,8 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            let backing = crate::resource::texture_memory(r).map(|(address, _)| address);
+            format!("{r:p} {}x{} f{} flags {:#x} backing={backing:?}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
     match view {

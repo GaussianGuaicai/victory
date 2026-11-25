@@ -456,6 +456,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            #[cfg(feature = "diagnostics")]
+            crate::capture::trace_auto_copy("whole", dst, src);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -553,6 +555,7 @@ extern "system" fn copy_texture_region(
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
+            crate::capture::trace_auto_copy("region", dst.resource, src.resource);
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
                 let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
@@ -715,6 +718,11 @@ extern "system" fn clear_rtv(
                 )]);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::draw::trace_texture_binding(list, record.resource, "clear") {
+            tracing::info!(list = ?std::ptr::from_ref(list), resource = ?record.resource, ?color, rectangles = count,
+                "recorded matching texture clear");
         }
     }
     #[cfg(not(windows))]

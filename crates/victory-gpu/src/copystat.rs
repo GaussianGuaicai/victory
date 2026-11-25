@@ -37,12 +37,117 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    WholeReadNs,
+    FailedReadNs,
+    RetryNs,
+    ZeroNs,
+    SinglePagePieces,
+    WritebackUniqueRanges,
+    WritebackCollectNs,
+    WritebackMergeNs,
+    WritebackMergeBytes,
+    WritebackCompareNs,
+    WritebackReadNs,
+    WritebackWriteNs,
+    WritebackWatchNs,
+    WritebackWriteBytes,
+    WritebackFirstOkNs,
+    WritebackFirstFailedNs,
+    WritebackRetryNs,
+    WritebackFirstCalls,
+    WritebackFailedCalls,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = C::WritebackFailedCalls as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+const PAGE: usize = 4096;
+static REFRESH_GAPS: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+
+pub(crate) fn refresh_gaps_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_COPY_GAPS").is_some())
+}
+
+pub(crate) struct RefreshProbe {
+    gaps: Vec<(usize, usize)>,
+    pub(crate) span: usize,
+    pub(crate) requested: usize,
+    pub(crate) copied_gap: usize,
+    pub(crate) watch_us: u64,
+}
+
+impl RefreshProbe {
+    pub(crate) fn new(mut requests: Vec<(usize, usize)>) -> Self {
+        requests.sort_unstable();
+        let start = requests[0].0;
+        let mut end = start;
+        let mut requested = 0;
+        let mut gaps = Vec::new();
+        for (from, to) in requests {
+            if from > end {
+                let gap_start = end.saturating_add(PAGE - 1) & !(PAGE - 1);
+                let gap_end = from & !(PAGE - 1);
+                if gap_start < gap_end {
+                    gaps.push((gap_start, gap_end));
+                }
+            }
+            requested += to.saturating_sub(end.max(from));
+            end = end.max(to);
+        }
+        Self {
+            gaps,
+            span: end - start,
+            requested,
+            copied_gap: 0,
+            watch_us: 0,
+        }
+    }
+
+    pub(crate) fn copy(&mut self, from: usize, to: usize) {
+        self.copied_gap += self
+            .gaps
+            .iter()
+            .skip_while(|&&(_, end)| end <= from)
+            .take_while(|&&(start, _)| start < to)
+            .map(|&(start, end)| to.min(end) - from.max(start))
+            .sum::<usize>();
+    }
+
+    pub(crate) fn record(self, elapsed_us: u64) {
+        if self.gaps.is_empty() {
+            return;
+        }
+        let mut totals = REFRESH_GAPS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (total, value) in totals.iter_mut().zip([
+            1,
+            self.span as u64,
+            self.requested as u64,
+            self.copied_gap as u64,
+            elapsed_us,
+            self.watch_us,
+        ]) {
+            *total += value;
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn refresh_probe_counts_only_unrequested_whole_pages() {
+    let mut probe = RefreshProbe::new(vec![(3 * PAGE + 1, 4 * PAGE), (1, 40), (20, 80)]);
+    assert_eq!(probe.span, 4 * PAGE - 1);
+    assert_eq!(probe.requested, 79 + PAGE - 1);
+    probe.copy(1, PAGE);
+    assert_eq!(probe.copied_gap, 0);
+    probe.copy(PAGE + 8, 2 * PAGE + 8);
+    assert_eq!(probe.copied_gap, PAGE);
+    assert_eq!(probe.watch_us, 0);
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -88,6 +193,23 @@ fn page_faults() -> u64 {
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
+    if refresh_gaps_enabled() {
+        let [flushes, span, requested, copied_gap, elapsed, watch] = std::mem::take(
+            &mut *REFRESH_GAPS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        tracing::info!(
+            frames,
+            flushes,
+            span,
+            requested,
+            copied_gap,
+            elapsed_us = elapsed,
+            watch_us = watch,
+            "shadow refreshes with whole-page gaps (window totals)"
+        );
+    }
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
@@ -95,6 +217,39 @@ pub(crate) fn log(frames: f64) {
         .iter()
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
         .collect();
+    if refresh_gaps_enabled() {
+        tracing::info!(
+            frames,
+            whole_ms = c[C::WholeReadNs as usize] / 1e6,
+            failed_ms = c[C::FailedReadNs as usize] / 1e6,
+            retry_ms = c[C::RetryNs as usize] / 1e6,
+            zero_ms = c[C::ZeroNs as usize] / 1e6,
+            single_page_pieces = c[C::SinglePagePieces as usize],
+            "mapped copy stages (ms/frame)"
+        );
+        tracing::info!(
+            frames,
+            unique_ranges = c[C::WritebackUniqueRanges as usize],
+            collect_ms = c[C::WritebackCollectNs as usize] / 1e6,
+            merge_ms = c[C::WritebackMergeNs as usize] / 1e6,
+            merge_mb = c[C::WritebackMergeBytes as usize] / 1e6,
+            compare_ms = c[C::WritebackCompareNs as usize] / 1e6,
+            read_ms = c[C::WritebackReadNs as usize] / 1e6,
+            write_ms = c[C::WritebackWriteNs as usize] / 1e6,
+            watch_ms = c[C::WritebackWatchNs as usize] / 1e6,
+            write_mb = c[C::WritebackWriteBytes as usize] / 1e6,
+            "writeback stages (per frame)"
+        );
+        tracing::info!(
+            frames,
+            first_calls = c[C::WritebackFirstCalls as usize],
+            failed_calls = c[C::WritebackFailedCalls as usize],
+            first_ok_ms = c[C::WritebackFirstOkNs as usize] / 1e6,
+            first_failed_ms = c[C::WritebackFirstFailedNs as usize] / 1e6,
+            retry_ms = c[C::WritebackRetryNs as usize] / 1e6,
+            "mapped write stages (per frame)"
+        );
+    }
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(

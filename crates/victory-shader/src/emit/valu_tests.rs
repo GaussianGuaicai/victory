@@ -69,23 +69,36 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_shader(body, false)
+}
+
+fn build_valu_shader(body: &[u32], exchange: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
     words.extend_from_slice(&s_load_dwordx4(8, 4));
     // Copy root constants s0..s3 into v1..v4 so VALU instructions operate on
     // VGPRs just as they do in real shaders.
-    for i in 0..4u8 {
-        words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
+    if !exchange {
+        for i in 0..4u8 {
+            words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
+        }
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    if exchange {
+        for (data, offset) in [(1, 0), (2, 256), (3, 512), (4, 768)] {
+            let [opcode, operands] = buffer_store_dword(data, 8, offset);
+            words.extend_from_slice(&[opcode | (1 << 12), operands | 7]);
+        }
+    } else {
+        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    }
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64: exchange,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -116,8 +129,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            rsrc2: (5 << 1) | (u32::from(exchange) << 11),
+            threads: if exchange { [8, 8, 1] } else { [1, 1, 1] },
         }),
         code,
     };
@@ -127,7 +140,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -137,7 +150,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
+    };
+    let lowered = if exchange {
+        lower::lower_wave32_exchange_fixture(&parts)
+    } else {
+        lower::lower(&parts)
+    }
     .expect("lower");
 
     let shader = HostShader {
@@ -166,6 +184,84 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// WARP can end the test process with an access violation. Other GPU test
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+#[should_panic(expected = "wave32 exchange outside a converged block")]
+fn wave32_exchange_rejects_exec_branch() {
+    build_valu_shader(&[
+        0x7DA4_0080,
+        0xBF88_0002,
+        0xD760_0006, 0x0001_4100,
+    ], true);
+}
+
+#[test]
+fn emitted_wave64_readlane_crosses_physical_wave32() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|error| error.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    let wave_options = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            std::ptr::from_mut(&mut options).cast(),
+            std::mem::size_of_val(&options) as u32,
+        )
+    };
+    if wave_options.is_err()
+        || !options.WaveOps.as_bool()
+        || !(options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&32)
+    {
+        eprintln!("no fixed wave32 hardware support; skipped");
+        return;
+    }
+    let flatten = vop3(0x143, 0, 136, vgpr(1), vgpr(0));
+    let shader = build_valu_shader(&[
+        flatten[0], flatten[1],
+        0x4A0E_0100, 0x4A0E_0F07,
+        vop1(1, 5, 193),
+        0x7DA4_0080,
+        0xBF88_0002,
+        0x4A00_0081,
+        0x4A0A_0BC1,
+        0xBEFE_04C1,
+        0xBE82_0480,
+        0x4A0A_0B81,
+        0x7D84_0A80,
+        0x8882_026A,
+        0x8AFE_027E,
+        0xBF89_FFFB,
+        0x88FE_027E,
+        0xD760_0006, 0x0001_4100,
+        vop1(1, 1, sgpr(6)),
+        0x4A00_00C0,
+        0xD760_0006, 0x0001_3F00,
+        vop1(1, 2, sgpr(6)),
+        (0x36 << 26) | (0x35 << 18) | 0x401F, 0x0300_0000,
+        vop3(0x365, 4, 255, 128, 0)[0], vop3(0x365, 4, 255, 128, 0)[1], 0x5555_5555,
+        vop3(0x366, 4, 255, vgpr(4), 0)[0], vop3(0x366, 4, 255, vgpr(4), 0)[1], 0xAAAA_AAAA,
+    ], true);
+    let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+    let output = host.dispatch(&root, &pipeline, &Dispatch {
+        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+        views: &[View::RawUav(256)],
+        samplers: &[],
+        groups: [1, 1, 1],
+    }).unwrap();
+    assert_eq!(output[0][..64], [32; 64]);
+    assert_eq!(output[0][64..128], [95; 64]);
+    assert_eq!(output[0][128..192], (0..64).map(|lane| {
+        let source = lane ^ 16;
+        64 + source + u32::from(source == 0)
+    }).collect::<Vec<_>>());
+    let mask = 0xAAAA_AAAA_5555_5555u64;
+    assert_eq!(output[0][192..], (0..64).map(|lane| (mask & ((1u64 << lane) - 1)).count_ones()).collect::<Vec<_>>());
+}
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.

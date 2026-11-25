@@ -65,9 +65,71 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if super::wave32_exchange_enabled() && exchange_candidate(parts) {
+        match check_exchange_sites(parts).and_then(|()| lower_impl(parts, true)) {
+            Ok(lowered) => {
+                eprintln!("wave32 exchange selected: native code {} bytes", parts.native.code.len());
+                return Ok(lowered);
+            }
+            Err(reason) => eprintln!("wave32 exchange fallback: native code {} bytes: {reason}", parts.native.code.len()),
+        }
+    }
+    lower_impl(parts, false)
+}
+
+fn exchange_candidate(parts: &Parts) -> bool {
+    parts.native.wave64
+        && matches!(parts.native.io, StageIo::Cs(cs) if cs.threads == [8, 8, 1] && cs.lds_bytes() == 0)
+        && parts.p.blocks.iter().flat_map(|block| &block.insts).any(|instruction| {
+            matches!(instruction.name(), "v_readlane_b32" | "ds_swizzle_b32" | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
+        })
+}
+
+fn check_exchange_sites(parts: &Parts) -> Result<(), ShaderError> {
+    let converged = parts.st.converged_exchange_blocks().ok_or(ShaderError::Unsupported {
+        offset: 0,
+        what: "wave32 exchange requires statically resolved control flow",
+    })?;
+    for (block, instructions) in parts.p.blocks.iter().enumerate() {
+        for (index, instruction) in instructions.insts.iter().enumerate() {
+            if matches!(instruction.name(), "v_readlane_b32" | "ds_swizzle_b32")
+                && (!converged[block] || parts.st.guards[block][index].is_some())
+            {
+                return Err(ShaderError::Unsupported {
+                    offset: instruction.machine.offset,
+                    what: if parts.st.guards[block][index].is_some() {
+                        "wave32 exchange at an EXEC-guarded instruction"
+                    } else {
+                        "wave32 exchange outside a converged block"
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn lower_wave32_exchange_fixture(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if !exchange_candidate(parts) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "wave32 exchange requires unguarded converged sites in a forward-only wave64 group",
+        });
+    }
+    check_exchange_sites(parts)?;
+    lower_impl(parts, true)
+}
+
+fn lower_impl(parts: &Parts, exchange_fixture: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut lower = Lower::new(parts, &bad);
+        if exchange_fixture {
+            lower.s.wave_size = Some(32);
+            lower.s.lds_dwords = 64;
+        }
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -902,6 +964,12 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if self.exchange_fixture() && self.s.flags & flags::WAVE_OPS != 0 {
+            return Err(Stop::Fail(ShaderError::Unsupported {
+                offset: 0,
+                what: "native wave operations remain after wave32 exchange lowering",
+            }));
+        }
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -1883,7 +1951,7 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes || self.exchange_fixture() {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
@@ -1987,6 +2055,11 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
+        if self.exchange_fixture() {
+            return self.s.op(
+                self.cur, "flattenedThreadIdInGroup.i32", Attr::ReadNone, self.s.t.i32, 96, &[],
+            );
+        }
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
@@ -2037,6 +2110,28 @@ impl<'a> Lower<'a> {
             117,
             &[x, lane],
         )
+    }
+
+    fn exchange_fixture(&self) -> bool {
+        self.x.native.wave64 && self.s.wave_size == Some(32)
+    }
+
+    fn fixture_read_lane(&mut self, value: V, lane: V) -> V {
+        let block = self.cur;
+        let flat = self.s.op(
+            block, "flattenedThreadIdInGroup.i32", Attr::ReadNone, self.s.t.i32, 96, &[],
+        );
+        let scratch = self.s.lds();
+        let own = self.s.m.element(block, scratch, flat);
+        self.s.m.store(block, own, value);
+        let mode = self.s.m.i32(9);
+        self.s.op(block, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        let mask = self.s.m.i32(63);
+        let lane = self.s.m.bin(block, Bin::And, lane, mask);
+        let source = self.s.m.element(block, scratch, lane);
+        let result = self.s.m.load(block, source);
+        self.s.op(block, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        result
     }
 
     /// The float value of a register value.
@@ -2093,7 +2188,7 @@ impl<'a> Lower<'a> {
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
-            if !mesh_quad {
+            if !mesh_quad && !self.exchange_fixture() {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -2118,10 +2213,10 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
-                self.quad_pick(x, src)
-            } else {
-                self.read_lane(x, src)
+            let r = match mesh_quad {
+                false if self.exchange_fixture() => self.fixture_read_lane(x, src),
+                true => self.quad_pick(x, src),
+                false => self.read_lane(x, src),
             };
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
@@ -4204,6 +4299,10 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                if self.exchange_fixture() {
+                    let result = self.fixture_read_lane(a, lane);
+                    return int(self, result);
+                }
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -5228,7 +5327,7 @@ impl<'a> Lower<'a> {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
                     self.s.flags |= flags::WAVE_OPS;
-                } else if self.s.mesh.is_none() {
+                } else if self.s.mesh.is_none() && !self.exchange_fixture() {
                     self.cross_lane(false)?;
                 }
                 let lane = self.lane_index();

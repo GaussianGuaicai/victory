@@ -272,8 +272,10 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
+    {
+        if crate::capture::listed(frame) {
+            crate::capture::dump_targets(frame);
+        }
     }
     #[cfg(windows)]
     if planes > 0
@@ -289,27 +291,40 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        #[cfg(feature = "diagnostics")]
+        let source = crate::capture::auto_targets().then(|| texture.clone());
         let shown = host.present(texture, state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
+        {
+            let capture = blinks(frame, resource, state, shown);
+            crate::capture::finish_auto_targets(frame, capture && !crate::capture::listed(frame), || {
+                if let Some(source) = source {
+                    crate::capture::dump_present_source(host, &source, state, frame, resource);
+                }
+            });
+        }
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::dump_selected_inputs(frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
+fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) -> bool {
     static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let drawn = crate::draw::drawn();
     let black = shown.unwrap_or(false);
     let draws = crate::draw::take_frame();
-    if black && !last.0 {
+    let transition = black && !last.0;
+    let capture = black && drawn.saturating_sub(last.1) >= 1_000;
+    if transition {
         last.2 += 1;
         tracing::warn!(
             frame,
@@ -332,6 +347,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
         tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
     }
     *last = (black, drawn, last.2);
+    capture
 }
 
 /// A run of destination pages: how they are mapped (0 pool pages from

@@ -118,11 +118,19 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_CAPTURE_DRAWN_BLACK=1` | with a capture directory and target dumping enabled, dumps the present source and up to 64 noted targets on the first black frame with at least 1,000 host draws |
+| `VICTORY_TRACE_DRAW_SHADER=<hash>` | logs up to 32 matching direct draws; with a capture directory and target dumping enabled, saves the first match's frame and up to eight known single-sampled 2D inputs, largest first |
+| `VICTORY_TRACE_DRAW_SNAPSHOTS=1` | with shader tracing and target dumping enabled, instead copies known texture inputs before the first matching direct draw and color targets before and after it; not for performance runs |
+| `VICTORY_TRACE_UAV_TEXTURE=<width>x<height>:<format>` | traces matching SRV, UAV and RTV bindings, color clears, direct non-indexed draws and recorded compute dispatches by numeric host DXGI format; submission IDs and list positions show queue order, not successful write completion |
+| `VICTORY_CAPTURE_DISPATCH_SHADER=<hash>` | with a capture directory and texture filter, reads back up to eight matching UAVs around their direct or indirect dispatch and up to four matching SRVs before the first selected direct dispatch. FP16 readbacks include a raw RGBA digest without row padding. Not for performance runs |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer; logs native thread-group geometry, LDS usage and explicit lane operations for rejected compute pipelines. A wave64 requirement cannot be fixed by changing the wave-size declaration on a wave32-only adapter. Keep this off for performance measurements |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_COPY_GAPS=1` | logs merged shadow refresh ranges, bytes sent to the copy path on whole unrequested pages, and write-watch time |
+| `VICTORY_WRITEBACK_SCALAR=1` | uses the old bytewise CPU/GPU writeback merge for diagnostic comparisons; `VICTORY_COPY_GAPS=1` logs merge time and bytes separately from range collection |
+| `VICTORY_WAVE32_EXCHANGE=1` | experimental: tries wave64 translation for 8x8x1 compute groups without original shared memory. Shared-memory exchanges must be unguarded and outside loops, on a path every lane must reach even when a loop hits its iteration limit. Other shaders keep their existing translation. Requires wave32; not a general compatibility or performance fix |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
@@ -130,6 +138,25 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+Copy-gap counters are totals for the copy-stat window, not per-frame values.
+`span` and `requested` describe sparse refreshes before write-watch filtering;
+`copied_gap` is the logical byte count after filtering, not measured hardware
+traffic. `watch_us` is time spent checking all pages of those sparse refreshes,
+not just the gaps. Use the default copy mode and leave this probe off for
+performance comparisons.
+
+The same probe reports `mapped copy stages` in milliseconds per frame:
+successful and failed initial reads (`whole_ms`, `failed_ms`), fallback
+traversal and retries (`retry_ms`), and zero fill (`zero_ms`). The first
+window after entering a scene can include frames from the preceding scene.
+
+`writeback stages` separates range collection, snapshot comparison, guest
+memory reads and writes, byte merging, and write-watch bookkeeping. `write_mb`
+counts bytes requested of the write path before any retries, not bytes
+successfully written or physical memory traffic.
+`mapped write stages` counts first write attempts and failures, and reports
+successful first attempts, failed first attempts, and retries separately.
 
 ## License
 

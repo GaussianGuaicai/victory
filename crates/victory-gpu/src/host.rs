@@ -394,6 +394,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    buffer_states: std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -411,6 +412,14 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    #[cfg(feature = "diagnostics")]
+    texture_bindings: Vec<(&'static str, usize)>,
+    #[cfg(feature = "diagnostics")]
+    dispatch_uavs: Option<Vec<usize>>,
+    #[cfg(feature = "diagnostics")]
+    snapshots: Vec<(Option<String>, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>,
+    #[cfg(feature = "diagnostics")]
+    indirect_snapshots: Vec<(String, ID3D12Resource, u64)>,
 }
 
 impl Host {
@@ -491,6 +500,10 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_with_validation(runs);
+    }
+
+    fn execute_with_validation(&self, runs: &[&HostList]) -> Option<String> {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -501,10 +514,15 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let mut buffers = std::collections::HashMap::new();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                buffers.clear();
+            }
+            if let Some(prelude) = list.prelude(&mut buffers) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -526,6 +544,37 @@ impl Host {
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            {
+                let active = if groups.len() > 1 { &runs[i..i + 1] } else { runs };
+                let arguments = if INDIRECT_ARGUMENTS_ACTIVE.load(Ordering::Relaxed) != 0 {
+                    INDIRECT_ARGUMENTS.lock().unwrap_or_else(|error| error.into_inner()).clone()
+                } else {
+                    Vec::new()
+                };
+                for (position, list) in active.iter().enumerate() {
+                    let deferred = list.deferred();
+                    for &(kind, resource) in &deferred.texture_bindings {
+                        tracing::info!(submission = *submitted, position, list = ?std::ptr::from_ref(*list), kind,
+                            resource = format_args!("{resource:#x}"), "submitted texture binding");
+                    }
+                    if !arguments.is_empty() {
+                        for step in &deferred.copies {
+                            if let Step::GpuWrite(_, address, len) = step {
+                                for &argument in &arguments {
+                                    if *address < argument.saturating_add(12)
+                                        && argument < address.saturating_add(*len)
+                                    {
+                                        tracing::info!(submission = *submitted, position, list = ?std::ptr::from_ref(*list),
+                                            argument = format_args!("{argument:#x}"), address = format_args!("{address:#x}"),
+                                            len, "submitted indirect argument UAV overlap");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -579,6 +628,8 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let collect = crate::copystat::refresh_gaps_enabled().then(std::time::Instant::now);
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
@@ -592,6 +643,12 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some(collect) = collect {
+            use crate::copystat::{C, add};
+            add(C::WritebackCollectNs, collect.elapsed().as_nanos() as u64);
+            add(C::WritebackUniqueRanges, back.len() as u64);
+        }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
             let written = shadow.copy_back(address, len);
@@ -603,7 +660,26 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        self.log_messages();
+        #[cfg(feature = "diagnostics")]
+        for list in runs {
+            for (name, buffer, footprint) in &mut list.deferred().snapshots {
+                if let Some(name) = name.take() {
+                    crate::capture::save_snapshot(&name, buffer, footprint);
+                }
+            }
+            for (name, buffer, bytes) in list.deferred().indirect_snapshots.drain(..) {
+                let mut data = std::ptr::null_mut();
+                let range = D3D12_RANGE { Begin: 0, End: bytes as usize };
+                unsafe {
+                    if buffer.Map(0, Some(&range), Some(&mut data)).is_ok() {
+                        let words = std::slice::from_raw_parts(data.cast::<u32>(), bytes as usize / 4);
+                        tracing::info!(%name, list = ?std::ptr::from_ref(*list), ?words, "indirect dispatch readback");
+                        buffer.Unmap(0, None);
+                    }
+                }
+            }
+        }
+        self.log_messages()
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -782,7 +858,73 @@ impl Host {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+static INDIRECT_ARGUMENTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+#[cfg(feature = "diagnostics")]
+static INDIRECT_ARGUMENTS_ACTIVE: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn indirect_argument_trace_active() -> bool {
+    INDIRECT_ARGUMENTS_ACTIVE.load(Ordering::Relaxed) != 0
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_indirect_argument(address: u64) {
+    let mut arguments = INDIRECT_ARGUMENTS.lock().unwrap_or_else(|error| error.into_inner());
+    let address = address as usize;
+    if arguments.len() < 8 && !arguments.contains(&address) {
+        arguments.push(address);
+        INDIRECT_ARGUMENTS_ACTIVE.store(1, Ordering::Relaxed);
+    }
+}
+
 impl HostList {
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn mark_argument_writer(&self) -> Option<usize> {
+        (INDIRECT_ARGUMENTS_ACTIVE.load(Ordering::Relaxed) != 0).then(|| self.deferred().copies.len())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn argument_writer_targets(&self, mark: usize) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, u32)> {
+        static CAPTURED: AtomicU32 = AtomicU32::new(0);
+        let arguments = INDIRECT_ARGUMENTS.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let mut found = Vec::new();
+        for step in self.deferred().copies.iter().skip(mark) {
+            if let Step::GpuWrite(shadow, address, len) = step {
+                for &argument in &arguments {
+                    if argument >= *address && argument.saturating_add(12) <= address.saturating_add(*len)
+                        && !found.iter().any(|(_, candidate)| *candidate == argument)
+                    {
+                        found.push((shadow.clone(), argument));
+                    }
+                }
+            }
+        }
+        found.into_iter().filter_map(|(shadow, argument)| {
+            let index = CAPTURED.fetch_add(1, Ordering::Relaxed);
+            (index < 8).then_some((shadow, argument, index))
+        }).collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn snapshot_argument_writer_buffers(&self, mark: usize, shader: &str, index: u32, phase: &str) {
+        if index >= 4 {
+            return;
+        }
+        let ranges: Vec<_> = self.deferred().copies.iter().skip(mark).filter_map(|step| {
+            match step {
+                Step::GpuWrite(shadow, address, len) if (4..=128).contains(len) && len % 4 == 0 => {
+                    Some((shadow.clone(), *address, *len))
+                }
+                _ => None,
+            }
+        }).take(4).collect();
+        for (shadow, address, len) in ranges {
+            self.snapshot_indirect(&shadow.buffer, shadow.offset(address as u64), len as u64,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format!("writer-buffer-{shader}-{index}-{address:x}-{phase}"));
+        }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -925,12 +1067,85 @@ impl HostList {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn snapshot_indirect(&self, source: &ID3D12Resource, offset: u64, bytes: u64,
+        state: D3D12_RESOURCE_STATES, name: String) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1,
+            DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+        };
+        let mut target: Option<ID3D12Resource> = None;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        unsafe {
+            if !offset.checked_add(bytes).is_some_and(|end| end <= source.GetDesc().Width) {
+                return;
+            }
+            if host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut target,
+            ).is_err() {
+                return;
+            }
+            let Some(target) = target else { return };
+            self.buffer_state(source, copy);
+            self.list.CopyBufferRegion(&target, 0, source, offset, bytes);
+            self.buffer_state(source, state);
+            self.deferred().indirect_snapshots.push((name, target, bytes));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn snapshot_texture(&self, resource: crate::object::This, name: String) {
+        let Some(copy) = crate::resource::host_copy(resource) else { return };
+        let Some(host) = host() else { return };
+        let texture = &copy.texture;
+        let desc = unsafe { texture.GetDesc() };
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 {
+            return;
+        }
+        let state = self.states.lock().unwrap_or_else(|error| error.into_inner())
+            .get(&(std::sync::Arc::as_ptr(&copy) as usize)).map(|entry| entry.1);
+        let Some(state) = state else { return };
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        unsafe {
+            if state != source {
+                self.list.ResourceBarrier(&[transition(texture, state, source)]);
+            }
+            let snapshot = crate::capture::read_back(&host.device, &self.list, texture);
+            if state != source {
+                self.list.ResourceBarrier(&[transition(texture, source, state)]);
+            }
+            if let Some((buffer, footprint)) = snapshot {
+                self.deferred().snapshots.push((Some(name), buffer, footprint));
+            }
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        use std::collections::hash_map::Entry;
+        let mut deferred = self.deferred();
+        match deferred.buffer_states.entry(buffer.as_raw() as usize) {
+            Entry::Vacant(entry) => {
+                entry.insert((buffer.clone(), wanted, wanted));
+            }
+            Entry::Occupied(mut entry) => {
+                let before = std::mem::replace(&mut entry.get_mut().2, wanted);
+                if before != wanted {
+                    unsafe { self.list.ResourceBarrier(&[transition(buffer, before, wanted)]) };
+                }
+            }
+        }
+    }
+
+    fn prelude(&self, buffers: &mut std::collections::HashMap<usize, D3D12_RESOURCE_STATES>) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -943,6 +1158,11 @@ impl HostList {
                 })
             })
             .collect();
+        for (&key, (buffer, first, last)) in &self.deferred().buffer_states {
+            if let Some(before) = buffer_prelude_state(buffers, key, *first, *last) {
+                barriers.push(transition(buffer, before, *first));
+            }
+        }
         if barriers.is_empty() {
             return None;
         }
@@ -1010,6 +1230,37 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_texture_binding(&self, kind: &'static str, resource: usize) {
+        let mut deferred = self.deferred();
+        let entry = (kind, resource);
+        if !deferred.texture_bindings.contains(&entry) {
+            deferred.texture_bindings.push(entry);
+        }
+        if kind == "UAV"
+            && let Some(uavs) = &mut deferred.dispatch_uavs
+            && !uavs.contains(&resource)
+        {
+            uavs.push(resource);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn begin_dispatch_trace(&self) {
+        if crate::draw::texture_binding_filter().is_some() {
+            self.deferred().dispatch_uavs = Some(Vec::new());
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn end_dispatch_trace(&self) -> Vec<usize> {
+        if crate::draw::texture_binding_filter().is_some() {
+            self.deferred().dispatch_uavs.take().unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
@@ -1240,6 +1491,8 @@ impl HostList {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    #[cfg(feature = "diagnostics")]
+    refresh_requests: Vec<Vec<(usize, usize)>>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -1247,13 +1500,32 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
-        match self
+        let index = match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .enumerate()
+            .find(|(_, (entry, ..))| std::sync::Arc::ptr_eq(entry, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((index, (_, from, to))) => {
+                (*from, *to) = ((*from).min(address), (*to).max(end));
+                index
+            }
+            None => {
+                let index = self.refreshes.len();
+                self.refreshes.push((shadow.clone(), address, end));
+                index
+            }
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = index;
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::refresh_gaps_enabled() {
+            if index == self.refresh_requests.len() {
+                self.refresh_requests.push(Vec::new());
+            }
+            if len != 0 {
+                self.refresh_requests[index].push((address, end));
+            }
         }
     }
 
@@ -1271,12 +1543,29 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let mut requests = self.refresh_requests.drain(..);
         for (shadow, from, to) in self.refreshes.drain(..) {
+            #[cfg(feature = "diagnostics")]
+            let mut probe = requests
+                .next()
+                .filter(|ranges| ranges.len() > 1)
+                .map(crate::copystat::RefreshProbe::new);
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let copied = shadow.update(
+                from,
+                to - from,
+                #[cfg(feature = "diagnostics")]
+                &mut probe,
+            );
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                crate::copystat::range(from, to - from, us, 0);
+                if let Some(probe) = probe {
+                    probe.record(us);
+                }
+            }
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
@@ -1314,28 +1603,57 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    let profile = crate::copystat::refresh_gaps_enabled();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let elapsed = moved.elapsed();
+        add(C::MoveUs, elapsed.as_micros() as u64);
+        if profile {
+            add(if whole { C::WholeReadNs } else { C::FailedReadNs }, elapsed.as_nanos() as u64);
+        }
+    }
     if whole {
         return;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    #[cfg(feature = "diagnostics")]
+    let retry = profile.then(std::time::Instant::now);
+    #[cfg(feature = "diagnostics")]
+    let mut zero_ns = 0;
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
+            #[cfg(feature = "diagnostics")]
+            if profile && n <= 4096 - at % 4096 {
+                crate::copystat::add(crate::copystat::C::SinglePagePieces, 1);
+            }
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                    #[cfg(feature = "diagnostics")]
+                    let zero = profile.then(std::time::Instant::now);
                     // SAFETY: inside the destination, which is mapped.
                     unsafe { to.write_bytes(0, n) };
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(started) = zero {
+                        zero_ns += started.elapsed().as_nanos() as u64;
+                    }
                 }
             });
         }
     });
+    #[cfg(feature = "diagnostics")]
+    if let Some(started) = retry {
+        use crate::copystat::{C, add};
+        add(C::RetryNs, (started.elapsed().as_nanos() as u64).saturating_sub(zero_ns));
+        add(C::ZeroNs, zero_ns);
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1360,6 +1678,8 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(feature = "diagnostics")]
+    use crate::copystat::{C, add};
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
@@ -1367,9 +1687,30 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    let profile = crate::copystat::refresh_gaps_enabled();
+    #[cfg(feature = "diagnostics")]
+    let started = profile.then(std::time::Instant::now);
+    let whole = write(dst as usize, len);
+    #[cfg(feature = "diagnostics")]
+    if let Some(started) = started {
+        let elapsed = started.elapsed().as_nanos() as u64;
+        add(C::WritebackFirstCalls, 1);
+        if whole {
+            add(C::WritebackFirstOkNs, elapsed);
+        } else {
+            add(C::WritebackFailedCalls, 1);
+            add(C::WritebackFirstFailedNs, elapsed);
+        }
+    }
+    if whole {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = profile.then(std::time::Instant::now);
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
@@ -1377,6 +1718,10 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
     });
+    #[cfg(feature = "diagnostics")]
+    if let Some(started) = started {
+        add(C::WritebackRetryNs, started.elapsed().as_nanos() as u64);
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -1879,6 +2224,82 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
     text
+}
+
+fn buffer_prelude_state(
+    buffers: &mut std::collections::HashMap<usize, D3D12_RESOURCE_STATES>,
+    key: usize,
+    first: D3D12_RESOURCE_STATES,
+    last: D3D12_RESOURCE_STATES,
+) -> Option<D3D12_RESOURCE_STATES> {
+    let before = buffers.insert(key, last).unwrap_or(D3D12_RESOURCE_STATE_COMMON);
+    (before != first).then_some(before)
+}
+
+#[test]
+fn shadow_buffer_states_chain_only_within_a_submission() {
+    let mut batch = std::collections::HashMap::new();
+    let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let read = D3D12_RESOURCE_STATE_GENERIC_READ;
+    assert_eq!(buffer_prelude_state(&mut batch, 1, write, write), Some(D3D12_RESOURCE_STATE_COMMON));
+    assert_eq!(buffer_prelude_state(&mut batch, 1, read, read), Some(write));
+    assert_eq!(buffer_prelude_state(&mut batch, 1, read, read), None);
+    batch.clear();
+    assert_eq!(buffer_prelude_state(&mut batch, 1, read, read), Some(D3D12_RESOURCE_STATE_COMMON));
+}
+
+#[test]
+fn shadow_buffer_copy_sees_uav_write_across_lists() {
+    let require_debug = cfg!(feature = "diagnostics")
+        && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+    let Some(host) = host() else {
+        assert!(!require_debug, "no D3D12 host for debug validation");
+        eprintln!("no D3D12 host; skipped");
+        return;
+    };
+    assert!(!require_debug || host.messages.is_some(), "no D3D12 debug message queue");
+    host.log_messages();
+    let (arguments, input) = host.shared_buffer(12).expect("argument buffer");
+    let (result, output) = host.shared_buffer(12).expect("result buffer");
+    let write = host.new_list().expect("writer list");
+    let read = host.new_list().expect("reader list");
+    unsafe {
+        input.cast::<[u32; 3]>().write([1, 2, 7]);
+        output.cast::<[u32; 3]>().write([0; 3]);
+    }
+    assert!(crate::indirect::bound(
+        &write, &arguments, unsafe { arguments.GetGPUVirtualAddress() }, (10, 12, 1),
+    ));
+    read.buffer_state(&arguments, D3D12_RESOURCE_STATE_GENERIC_READ);
+    read.buffer_state(&result, D3D12_RESOURCE_STATE_COPY_DEST);
+    unsafe {
+        read.list.IASetVertexBuffers(0, Some(&[D3D12_VERTEX_BUFFER_VIEW {
+            BufferLocation: arguments.GetGPUVirtualAddress(),
+            SizeInBytes: 12,
+            StrideInBytes: 4,
+        }]));
+        read.list.CopyBufferRegion(&result, 0, &arguments, 0, 12);
+        write.list.Close().expect("close writer");
+        read.list.Close().expect("close reader");
+    }
+    let error = host.execute_with_validation(&[&write, &read]);
+    assert!(!require_debug || error.is_none(), "D3D12 submission error: {error:?}");
+    assert_eq!(unsafe { output.cast::<[u32; 3]>().read() }, [1, 1, 1]);
+
+    let reuse = host.new_list().expect("reuse list");
+    unsafe { input.cast::<[u32; 3]>().write([2, 3, 5]) };
+    assert!(crate::indirect::bound(
+        &reuse, &arguments, unsafe { arguments.GetGPUVirtualAddress() }, (10, 12, 1),
+    ));
+    reuse.buffer_state(&arguments, D3D12_RESOURCE_STATE_GENERIC_READ);
+    reuse.buffer_state(&result, D3D12_RESOURCE_STATE_COPY_DEST);
+    unsafe {
+        reuse.list.CopyBufferRegion(&result, 0, &arguments, 0, 12);
+        reuse.list.Close().expect("close reuse list");
+    }
+    let error = host.execute_with_validation(&[&reuse]);
+    assert!(!require_debug || error.is_none(), "D3D12 submission error: {error:?}");
+    assert_eq!(unsafe { output.cast::<[u32; 3]>().read() }, [2, 1, 1]);
 }
 
 pub(crate) fn transition(

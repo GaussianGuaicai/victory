@@ -31,7 +31,7 @@ pub(crate) fn listed(n: u64) -> bool {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && (n.is_power_of_two() || listed(n) || selected_frame(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -213,13 +213,148 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+static AUTO_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+static SELECTED_INPUTS: std::sync::Mutex<Option<(u64, Vec<usize>)>> = std::sync::Mutex::new(None);
+
+pub(crate) fn draw_snapshots() -> bool {
+    dump_on() && std::env::var_os("VICTORY_TRACE_DRAW_SNAPSHOTS").is_some()
+}
+
+pub(crate) fn save_snapshot(
+    name: &str,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
+    let layout = footprint.Footprint;
+    let mut data = std::ptr::null_mut();
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let pitch = layout.RowPitch as usize;
+        let byte_count = buffer.GetDesc().Width as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), byte_count);
+        if layout.Format.0 == 10
+            && let Some((digest, nonzero, nonfinite)) = fp16_summary(
+                layout.Width as usize, layout.Height as usize, pitch, rows,
+            )
+        {
+            tracing::info!(name, %digest, ?nonzero, ?nonfinite, "FP16 snapshot RGBA");
+        }
+        if let Some(rgba) = to_rgba(layout.Format.0 as u32, layout.Width as usize, layout.Height as usize, pitch, rows) {
+            save_as(name, layout.Width, layout.Height, layout.Width as usize * 4, false, &rgba);
+        }
+        buffer.Unmap(0, None);
+    }
+}
+
+fn fp16_summary(
+    width: usize, height: usize, pitch: usize, rows: &[u8],
+) -> Option<(blake3::Hash, [u64; 4], [u64; 4])> {
+    let row_bytes = width.checked_mul(8)?;
+    if row_bytes > pitch {
+        return None;
+    }
+    let mut hash = blake3::Hasher::new();
+    let mut nonzero = [0; 4];
+    let mut nonfinite = [0; 4];
+    for row in 0..height {
+        let start = row.checked_mul(pitch)?;
+        let pixels = rows.get(start..start.checked_add(row_bytes)?)?;
+        hash.update(pixels);
+        for pixel in pixels.chunks_exact(8) {
+            for (channel, bits) in pixel.chunks_exact(2).enumerate() {
+                let magnitude = u16::from_le_bytes([bits[0], bits[1]]) & 0x7fff;
+                nonzero[channel] += u64::from((1..0x7c00).contains(&magnitude));
+                nonfinite[channel] += u64::from(magnitude >= 0x7c00);
+            }
+        }
+    }
+    Some((hash.finalize(), nonzero, nonfinite))
+}
+
+fn selected_frame(frame: u64) -> bool {
+    SELECTED_INPUTS.lock().unwrap_or_else(|error| error.into_inner())
+        .as_ref().is_some_and(|(wanted, _)| *wanted == frame)
+}
+
+pub(crate) fn select_inputs(frame: u64, inputs: Vec<usize>) {
+    if dump_on() && !inputs.is_empty() {
+        let mut selected = SELECTED_INPUTS.lock().unwrap_or_else(|error| error.into_inner());
+        *selected = Some((frame, inputs));
+    }
+}
+
+pub(crate) fn dump_selected_inputs(frame: u64) {
+    if !dump_on() {
+        return;
+    }
+    let inputs = {
+        let mut selected = SELECTED_INPUTS.lock().unwrap_or_else(|error| error.into_inner());
+        match selected.as_ref() {
+            Some((wanted, _)) if *wanted == frame => selected.take().map(|(_, inputs)| inputs),
+            Some((wanted, _)) if *wanted < frame => {
+                *selected = None;
+                None
+            }
+            _ => None,
+        }
+    };
+    let (Some(inputs), Some(host)) = (inputs, crate::host::host()) else { return };
+    for (index, input) in inputs.into_iter().enumerate() {
+        let resource = input as crate::object::This;
+        let Some(copy) = crate::resource::host_copy(resource) else { continue };
+        let texture = &copy.texture;
+        let desc = unsafe { texture.GetDesc() };
+        if desc.SampleDesc.Count == 1 && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            let state = copy.state.load(std::sync::atomic::Ordering::Relaxed);
+            dump_one(host, texture, state, frame, &format!("selected-input-{index:02}"), resource, &desc);
+        }
+    }
+}
+
+pub(crate) fn auto_targets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    dump_on() && *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_DRAWN_BLACK").is_some())
+}
+
+pub(crate) fn trace_auto_copy(kind: &str, dst: crate::object::This, src: crate::object::This) {
+    if auto_pending() {
+        tracing::info!(frame_hint = crate::queue::presented() + 1, kind, ?src, ?dst, "recorded texture copy");
+    }
+}
+
+pub(crate) fn auto_pending() -> bool {
+    auto_targets() && !AUTO_DUMPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn finish_auto_targets(frame: u64, capture: bool, dump_source: impl FnOnce()) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !auto_targets() || AUTO_DUMPED.load(Relaxed) {
+        return;
+    }
+    if capture && !AUTO_DUMPED.swap(true, Relaxed) {
+        tracing::info!(frame, "capturing heavily drawn black frame targets");
+        dump_source();
+        dump_targets(frame);
+    } else {
+        TARGETS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() {
+        return;
+    }
+    let explicit = listed(crate::queue::presented() + 1);
+    if !explicit && (!auto_targets() || AUTO_DUMPED.load(std::sync::atomic::Ordering::Relaxed)) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|&(r, _)| r == resource as usize)
+    if (explicit || targets.len() < 64)
+        && !targets.iter().any(|&(r, _)| r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
         targets.push((resource as usize, copy));
@@ -240,8 +375,19 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        dump_one(host, texture, state, frame, &format!("{i:02}"), *resource as crate::object::This, &d);
     }
+}
+
+pub(crate) fn dump_present_source(
+    host: &crate::host::Host,
+    texture: &ID3D12Resource,
+    state: u32,
+    frame: u64,
+    resource: crate::object::This,
+) {
+    let desc = unsafe { texture.GetDesc() };
+    dump_one(host, texture, state, frame, "present-source", resource, &desc);
 }
 
 fn dump_one(
@@ -249,7 +395,7 @@ fn dump_one(
     texture: &ID3D12Resource,
     state: u32,
     frame: u64,
-    i: usize,
+    label: &str,
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
 ) {
@@ -283,7 +429,7 @@ fn dump_one(
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                "frame-{frame}-{label}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
@@ -520,6 +666,16 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fp16_summary_ignores_padding_but_checks_all_channels() {
+        let pixel = [0, 0x80, 0, 0xbc, 0, 0x7c, 1, 0];
+        let rows = [pixel.as_slice(), &[0xff; 8], &[0; 8]].concat();
+        let (digest, nonzero, nonfinite) = super::fp16_summary(1, 2, 16, &rows).unwrap();
+        assert_eq!(digest, blake3::hash(&[pixel.as_slice(), &[0; 8]].concat()));
+        assert_eq!(nonzero, [0, 1, 0, 1]);
+        assert_eq!(nonfinite, [0, 0, 1, 0]);
+        assert!(super::fp16_summary(1, 2, 16, &rows[..23]).is_none());
+    }
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

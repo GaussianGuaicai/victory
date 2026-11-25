@@ -1074,6 +1074,128 @@ fn close(a: u32, b: u32) -> bool {
 }
 
 #[test]
+fn logical_wave64_shared_memory_on_wave32() {
+    use super::host::{Dispatch, View};
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|error| error.into_inner());
+    let pc = std::env::var_os("VICTORY_PC_DXC").map(PathBuf::from).or_else(|| {
+        Some(super::validator::Validator::default_path()?.with_file_name("dxc.exe"))
+    });
+    let Some(pc) = pc.filter(|path| path.is_file()) else {
+        eprintln!("no PC compiler; skipped");
+        return;
+    };
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    let wave_options = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            std::ptr::from_mut(&mut options).cast(),
+            std::mem::size_of_val(&options) as u32,
+        )
+    };
+    if wave_options.is_err()
+        || !options.WaveOps.as_bool()
+        || !(options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&32)
+    {
+        eprintln!("no wave32 support; skipped");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("victory-wave64-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shader = compile(&pc, &dir, r#"
+        groupshared uint payload[64];
+        groupshared uint active[64];
+        groupshared uint group_active;
+        [RootSignature("DescriptorTable(UAV(u0))")]
+        [WaveSize(32)] [numthreads(8, 8, 1)]
+        void cs(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
+            uint output_base = (group.x * 64 + lane) * 40;
+            payload[lane] = 1000 + 3 * lane;
+            active[lane] = (lane % 3 != 0) ? 1 : 0;
+            GroupMemoryBarrierWithGroupSync();
+            uint prefix = 0;
+            for (uint index = 0; index < lane; ++index) prefix += active[index];
+            uint mirror = payload[63 - lane];
+            uint opposite = payload[lane ^ 32];
+            GroupMemoryBarrierWithGroupSync();
+            payload[lane] = opposite + prefix;
+            GroupMemoryBarrierWithGroupSync();
+            uint second = 0xffffffff;
+            [branch] if (active[lane]) second = payload[lane ^ 32];
+            GroupMemoryBarrierWithGroupSync();
+            uint state = lane + 1;
+            uint steps = group.x == 0 ? lane % (lane < 32 ? 2 : 5) : 0;
+            for (uint slot = 0; slot < 4; ++slot) {
+                uint address = output_base + 20 + slot * 4;
+                outb.Store(address, 0xffffffff);
+            }
+            uint round = 0;
+            [loop] for (; round < 5; ++round) {
+                active[lane] = round < steps;
+                GroupMemoryBarrierWithGroupSync();
+                if (lane == 0) {
+                    uint work = 0;
+                    for (uint index = 0; index < 64; ++index) work |= active[index];
+                    group_active = work;
+                }
+                GroupMemoryBarrierWithGroupSync();
+                if (group_active == 0) break;
+                payload[lane] = state;
+                GroupMemoryBarrierWithGroupSync();
+                [branch] if (round < steps) {
+                    state += payload[lane ^ 32] + round;
+                    outb.Store(output_base + 20 + round * 4, state);
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+            outb.Store4(output_base, uint4(mirror, second, prefix, WaveGetLaneCount()));
+            outb.Store(output_base + 16, state);
+            outb.Store(output_base + 36, round);
+        }
+    "#, "cs", "cs_6_6");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &shader) }.unwrap();
+    let pso = host.compute_pipeline_with(&root, &shader).unwrap();
+    let values = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![(0, Root::Table { sampler: false, index: 0 })],
+        views: &[View::RawUav(2 * 64 * 10)],
+        samplers: &[],
+        groups: [2, 1, 1],
+    }).unwrap();
+    assert_eq!(values[0].len(), 2 * 64 * 10);
+    let mut expected = std::array::from_fn::<_, 64, _>(|lane| lane as u32 + 1);
+    let mut expected_stores = [[u32::MAX; 4]; 64];
+    for round in 0..4 {
+        let previous = expected;
+        for (lane, state) in expected.iter_mut().enumerate() {
+            if round < lane % if lane < 32 { 2 } else { 5 } {
+                *state += previous[lane ^ 32] + round as u32;
+                expected_stores[lane][round] = *state;
+            }
+        }
+    }
+    for lane in 0..64u32 {
+        let start = lane as usize * 10;
+        let prefix = |end| (0..end).filter(|index| index % 3 != 0).count() as u32;
+        assert_eq!(values[0][start..start + 4], [
+            1000 + 3 * (63 - lane),
+            if lane % 3 != 0 { 1000 + 3 * lane + prefix(lane ^ 32) } else { u32::MAX },
+            prefix(lane), 32,
+        ], "lane {lane}");
+        assert_eq!(values[0][start + 4], expected[lane as usize], "masked loop, lane {lane}");
+        assert_eq!(values[0][start + 5..start + 9], expected_stores[lane as usize], "masked stores, lane {lane}");
+        assert_eq!(values[0][start + 9], 4, "group exit, lane {lane}");
+        let empty_start = 64 * 10 + start;
+        assert_eq!(values[0][empty_start + 4], lane + 1, "empty group state, lane {lane}");
+        assert_eq!(values[0][empty_start + 5..empty_start + 9], [u32::MAX; 4], "empty group writes, lane {lane}");
+        assert_eq!(values[0][empty_start + 9], 0, "empty group exit, lane {lane}");
+    }
+}
+
+#[test]
 fn translated_compute_matches_pc() {
     use super::host::{Dispatch, Stride, View};
     let Some((console, pc)) = tools() else {

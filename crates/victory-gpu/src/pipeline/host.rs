@@ -436,6 +436,12 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    #[cfg(feature = "diagnostics")]
+                    if std::env::var_os("VICTORY_D3D12_DEBUG").is_some()
+                        && let Some((shader, _)) = stages.first()
+                    {
+                        shader.trace_compute_requirements();
+                    }
                     host.log_messages();
                     return None;
                 }

@@ -395,6 +395,11 @@ impl HostHeap {
         }
         Some(text)
     }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn slot_resource(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?.clone()
+    }
 }
 
 /// Logs `what` the first time it happens.

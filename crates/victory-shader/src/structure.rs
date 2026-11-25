@@ -356,6 +356,85 @@ pub struct Structured {
 }
 
 impl Structured {
+    pub(crate) fn converged_exchange_blocks(&self) -> Option<Vec<bool>> {
+        let exit = self.exits.len();
+        let mut next_common = vec![exit; exit + 1];
+        let mut covered_until = 0;
+        let mut back_edges = vec![0; exit];
+        for (block, branch) in self.exits.iter().enumerate().rev() {
+            next_common[block] = match *branch {
+                LaneExit::End => exit,
+                LaneExit::Jump(next) if (block + 1..exit).contains(&next) => next,
+                LaneExit::Branch { mut taken, mut not_taken, .. }
+                    if (block + 1..exit).contains(&taken) && (block + 1..exit).contains(&not_taken) =>
+                {
+                    while taken != not_taken {
+                        if taken < not_taken {
+                            taken = next_common[taken];
+                        } else {
+                            not_taken = next_common[not_taken];
+                        }
+                    }
+                    taken
+                }
+                LaneExit::Jump(target) if target <= block => {
+                    back_edges[target] = back_edges[target].max(block + 1);
+                    exit
+                }
+                LaneExit::Branch { taken, not_taken, .. } if taken < exit && not_taken < exit => {
+                    for target in [taken, not_taken].into_iter().filter(|&target| target <= block) {
+                        back_edges[target] = back_edges[target].max(block + 1);
+                    }
+                    [taken, not_taken].into_iter().find(|&target| target > block).unwrap_or(exit)
+                }
+                _ => return None,
+            };
+        }
+        let mut converged = vec![false; exit];
+        let mut block = 0;
+        while block < exit {
+            converged[block] = true;
+            block = next_common[block];
+        }
+        for (block, end) in back_edges.into_iter().enumerate() {
+            if end != 0 && self.exits.iter().enumerate().any(|(source, branch)| {
+                if (block..end).contains(&source) {
+                    return false;
+                }
+                let enters_middle = |target| (block + 1..end).contains(&target);
+                match *branch {
+                    LaneExit::Jump(target) => enters_middle(target),
+                    LaneExit::Branch { taken, not_taken, .. } =>
+                        enters_middle(taken) || enters_middle(not_taken),
+                    _ => false,
+                }
+            }) {
+                return None;
+            }
+            covered_until = covered_until.max(end);
+            converged[block] &= block >= covered_until;
+        }
+        Some(converged)
+    }
+
+    /// Blocks reached by the whole group along the unconditional entry path.
+    /// This deliberately does not prove convergence after a branch or loop.
+    pub fn unconditional_entry_blocks(&self) -> Vec<bool> {
+        let mut reached = vec![false; self.exits.len()];
+        let mut block = 0;
+        while let Some(entry) = reached.get_mut(block) {
+            if *entry {
+                break;
+            }
+            *entry = true;
+            match self.exits[block] {
+                LaneExit::Jump(next) if next > block => block = next,
+                _ => break,
+            }
+        }
+        reached
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -1142,6 +1221,23 @@ mod tests {
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
         assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+        assert_eq!(s.unconditional_entry_blocks(), [true, false, false]);
+        assert_eq!(s.converged_exchange_blocks(), Some(vec![true, false, true]));
+    }
+
+    #[test]
+    fn unconditional_entry_path_follows_forward_jumps() {
+        let program = build(&[0xBF82_0001, 0x7E02_0280, 0x7E04_0280, S_ENDPGM], true);
+        let structured = structure(&program).unwrap();
+        let LaneExit::Jump(target) = structured.exits[0] else {
+            panic!("expected an unconditional jump");
+        };
+        assert_eq!(
+            structured.unconditional_entry_blocks(),
+            (0..program.blocks.len())
+                .map(|block| block == 0 || block == target)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1187,10 +1283,19 @@ mod tests {
             panic!("{:?}", s.exits)
         };
         // Back while the lane's compare fails.
+        assert_eq!(s.converged_exchange_blocks(), Some(vec![true, false, true]));
         assert!(matches!(
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+        let mut side_entry = s;
+        side_entry.exits = vec![
+            LaneExit::Jump(2),
+            LaneExit::Jump(3),
+            LaneExit::Branch { when, taken: 1, not_taken: 3 },
+            LaneExit::End,
+        ];
+        assert_eq!(side_entry.converged_exchange_blocks(), None);
     }
 
     #[test]

@@ -102,6 +102,13 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// Whether to try the experimental wave32 translation for eligible compute shaders.
+pub fn wave32_exchange_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(feature = "diagnostics")
+        && *ENABLED.get_or_init(|| std::env::var("VICTORY_WAVE32_EXCHANGE").is_ok_and(|value| value == "1"))
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///

@@ -188,6 +188,8 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        use crate::copystat::{C, add};
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -204,6 +206,12 @@ impl Shadow {
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
             let mut at = from;
+            #[cfg(feature = "diagnostics")]
+            let profile = crate::copystat::refresh_gaps_enabled();
+            #[cfg(feature = "diagnostics")]
+            let mut merge_totals = (0, 0);
+            #[cfg(feature = "diagnostics")]
+            let mut stages = [0; 4];
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
                 // SAFETY: inside the mapping; only the submitting thread
@@ -211,30 +219,71 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                #[cfg(feature = "diagnostics")]
+                let started = profile.then(std::time::Instant::now);
+                let different = host != old;
+                #[cfg(feature = "diagnostics")]
+                if let Some(started) = started {
+                    stages[0] += started.elapsed().as_nanos() as u64;
+                }
+                #[cfg(feature = "diagnostics")]
+                let started = (profile && different).then(std::time::Instant::now);
+                let read = different && crate::host::read_into((start + at) as *const u8, title);
+                #[cfg(feature = "diagnostics")]
+                if let Some(started) = started {
+                    stages[1] += started.elapsed().as_nanos() as u64;
+                }
+                if read {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
+                    #[cfg(feature = "diagnostics")]
+                    let started = profile.then(std::time::Instant::now);
+                    #[cfg(feature = "diagnostics")]
+                    let changed = if scalar_writeback_enabled() {
+                        merge_writeback_scalar(title, host, old)
+                    } else {
+                        merge_writeback(title, host, old)
+                    };
+                    #[cfg(not(feature = "diagnostics"))]
+                    let changed = merge_writeback(title, host, old);
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(started) = started {
+                        merge_totals.0 += started.elapsed().as_nanos() as u64;
+                        merge_totals.1 += n as u64;
                     }
                     if changed {
+                        #[cfg(feature = "diagnostics")]
+                        let started = profile.then(std::time::Instant::now);
                         crate::watch::writing(start + at, n);
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(started) = started {
+                            stages[3] += started.elapsed().as_nanos() as u64;
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        let started = profile.then(std::time::Instant::now);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(started) = started {
+                            stages[2] += started.elapsed().as_nanos() as u64;
+                        }
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
+            #[cfg(feature = "diagnostics")]
+            if profile {
+                add(C::WritebackMergeNs, merge_totals.0);
+                add(C::WritebackMergeBytes, merge_totals.1);
+                add(C::WritebackWriteBytes, written as u64);
+            }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            #[cfg(feature = "diagnostics")]
+            let started = profile.then(std::time::Instant::now);
             if first < last
                 && !synced.is_empty()
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
@@ -244,6 +293,15 @@ impl Shadow {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
                     copied[page - base] = now;
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(started) = started {
+                stages[3] += started.elapsed().as_nanos() as u64;
+                for (counter, elapsed) in [C::WritebackCompareNs, C::WritebackReadNs, C::WritebackWriteNs, C::WritebackWatchNs]
+                    .into_iter().zip(stages)
+                {
+                    add(counter, elapsed);
                 }
             }
         }
@@ -262,7 +320,12 @@ impl Shadow {
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
-    pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn update(
+        &self,
+        address: usize,
+        len: usize,
+        #[cfg(feature = "diagnostics")] probe: &mut Option<crate::copystat::RefreshProbe>,
+    ) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -284,25 +347,59 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(
+                        at,
+                        a,
+                        #[cfg(feature = "diagnostics")]
+                        probe,
+                    );
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(
+                    at,
+                    to,
+                    #[cfg(feature = "diagnostics")]
+                    probe,
+                );
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(
+            from,
+            to,
+            #[cfg(feature = "diagnostics")]
+            probe,
+        )
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(
+        &self,
+        from: usize,
+        to: usize,
+        #[cfg(feature = "diagnostics")] probe: &mut Option<crate::copystat::RefreshProbe>,
+    ) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            #[cfg(feature = "diagnostics")]
+            let started = probe.as_ref().map(|_| std::time::Instant::now());
+            let writes = crate::watch::writes(from, to, true);
+            #[cfg(feature = "diagnostics")]
+            if let (Some(probe), Some(started)) = (probe.as_mut(), started) {
+                probe.watch_us += started.elapsed().as_micros() as u64;
+            }
+            if let Some((now, written)) = writes {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(
+                    from,
+                    to,
+                    now,
+                    &written,
+                    #[cfg(feature = "diagnostics")]
+                    probe,
+                );
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -313,14 +410,26 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        self.copy(from, to);
+        self.copy_refresh(
+            from,
+            to,
+            #[cfg(feature = "diagnostics")]
+            probe,
+        );
         to - from
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        #[cfg(feature = "diagnostics")] probe: &mut Option<crate::copystat::RefreshProbe>,
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -344,12 +453,37 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy_refresh(
+                    (first * PAGE).max(from),
+                    (page * PAGE).min(to),
+                    #[cfg(feature = "diagnostics")]
+                    probe,
+                );
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy_refresh(
+                (first * PAGE).max(from),
+                ((last + 1) * PAGE).min(to),
+                #[cfg(feature = "diagnostics")]
+                probe,
+            );
+        }
+        bytes
+    }
+
+    fn copy_refresh(
+        &self,
+        from: usize,
+        to: usize,
+        #[cfg(feature = "diagnostics")] probe: &mut Option<crate::copystat::RefreshProbe>,
+    ) -> usize {
+        let bytes = self.copy(from, to);
+        #[cfg(feature = "diagnostics")]
+        if let Some(probe) = probe {
+            let start = from.max(self.start as usize);
+            probe.copy(start, start + bytes);
         }
         bytes
     }
@@ -362,6 +496,101 @@ impl Shadow {
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
+    }
+}
+
+fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut changed = 0;
+    for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
+        let mask = 0u8.wrapping_sub(u8::from(*host_byte != *old_byte));
+        let delta = (*title_byte ^ *host_byte) & mask;
+        *title_byte ^= delta;
+        *host_byte = *title_byte;
+        changed |= delta;
+    }
+    changed != 0
+}
+
+#[cfg(feature = "diagnostics")]
+fn scalar_writeback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_WRITEBACK_SCALAR").is_some())
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+fn merge_writeback_scalar(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut changed = false;
+    for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
+        if *host_byte != *old_byte && *title_byte != *host_byte {
+            *title_byte = *host_byte;
+            changed = true;
+        }
+        *host_byte = *title_byte;
+    }
+    changed
+}
+
+#[cfg(test)]
+#[test]
+fn writeback_merge_matches_bytewise_oracle() {
+    for len in [0, 1, 63, 64, 65, 193, 65_536] {
+        let old = vec![0x11; len];
+        for stride in [1, 5, 67, len + 1] {
+            let mut title = old.clone();
+            let mut host = old.clone();
+            for index in (0..len).step_by(3) {
+                title[index] = 0x22;
+            }
+            for index in (0..len).step_by(stride) {
+                host[index] = if index % 2 == 0 { 0x22 } else { 0x33 };
+            }
+            let expected: Vec<_> = host.iter().zip(&old).zip(&title)
+                .map(|((&gpu, &previous), &cpu)| if gpu == previous { cpu } else { gpu })
+                .collect();
+            let changed = expected != title;
+            assert_eq!(merge_writeback(&mut title, &mut host, &old), changed);
+            assert_eq!(title, expected);
+            assert_eq!(host, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "microbenchmark"]
+fn writeback_merge_benchmark() {
+    use std::hint::black_box;
+
+    const SAMPLES: u32 = 2048;
+    let old = vec![1; 65_536];
+    let mut cpu = old.clone();
+    for byte in cpu.iter_mut().step_by(19) {
+        *byte = 4;
+    }
+    let mut title = old.clone();
+    let mut host = old.clone();
+    for stride in [1, 16, 64, 512, 4096] {
+        let mut gpu = old.clone();
+        for byte in gpu.iter_mut().step_by(stride) {
+            *byte = 2;
+        }
+        let mut elapsed = [std::time::Duration::ZERO; 2];
+        for iteration in 0..SAMPLES {
+            for index in [iteration as usize % 2, (iteration as usize + 1) % 2] {
+                title.copy_from_slice(&cpu);
+                host.copy_from_slice(&gpu);
+                let started = std::time::Instant::now();
+                let changed = if index == 0 {
+                    merge_writeback_scalar(black_box(&mut title), black_box(&mut host), black_box(&old))
+                } else {
+                    merge_writeback(black_box(&mut title), black_box(&mut host), black_box(&old))
+                };
+                elapsed[index] += started.elapsed();
+                black_box((changed, &title, &host));
+            }
+        }
+        let [baseline, merged] = elapsed.map(|time| time.as_secs_f64() * 1e6 / f64::from(SAMPLES));
+        eprintln!("GPU writes every {stride} bytes: {baseline:.2} -> {merged:.2} us per 64 KiB");
     }
 }
 

@@ -102,6 +102,63 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_compute_requirements(&self) {
+        use victory_shader::{Container, FourCC};
+        let Ok(container) = Container::parse(&self.container) else { return };
+        let Some(part) = container.part(FourCC::DXIL) else { return };
+        let Ok(programs) = victory_shader::native_programs(part.data) else { return };
+        for program in programs {
+            if let victory_shader::native::StageIo::Cs(compute) = program.io {
+                let Ok(instructions) = victory_shader::gfx10::decode(&program.code) else { continue };
+                let mut lane_ops = Vec::new();
+                let mut lane_sites = Vec::new();
+                let mut conditional_branches = 0;
+                let mut exec_branches = 0;
+                for (ordinal, name) in instructions.iter().enumerate()
+                    .filter_map(|(ordinal, instruction)| Some((ordinal, instruction.name()?)))
+                {
+                    conditional_branches += usize::from(name.starts_with("s_cbranch"));
+                    exec_branches += usize::from(name.starts_with("s_cbranch_exec"));
+                    if name.starts_with("ds_swizzle") || name.contains("permute")
+                        || name.starts_with("v_mbcnt") || matches!(name, "v_readlane_b32" | "v_writelane_b32")
+                    {
+                        lane_ops.push(name);
+                        if lane_sites.len() < 24 {
+                            lane_sites.push((ordinal, name, conditional_branches, exec_branches));
+                        }
+                    }
+                }
+                lane_ops.sort_unstable();
+                lane_ops.dedup();
+                let structured_sites = victory_shader::ir::build(
+                    &program.patched_code(), program.wave64, program.vgprs,
+                ).ok().and_then(|ir| {
+                    let structured = victory_shader::structure::structure(&ir).ok()?;
+                    let mut counts = [0usize; 2];
+                    let entry_blocks = structured.unconditional_entry_blocks();
+                    let mut unconditional_lane_sites = 0;
+                    for (block, instructions) in ir.blocks.iter().enumerate() {
+                        for (index, instruction) in instructions.insts.iter().enumerate() {
+                            if lane_ops.contains(&instruction.name()) {
+                                let guarded = structured.guards[block][index].is_some();
+                                counts[usize::from(guarded)] += 1;
+                                unconditional_lane_sites += usize::from(entry_blocks[block] && !guarded);
+                            }
+                        }
+                    }
+                    Some((counts, unconditional_lane_sites))
+                });
+                let unconditional_lane_sites = structured_sites.map(|(_, count)| count);
+                let structured_sites = structured_sites.map(|(counts, _)| counts);
+                tracing::info!(shader = %self.hash, wave64 = program.wave64, threads = ?compute.threads,
+                    lds_bytes = compute.lds_bytes(), ?lane_ops, ?lane_sites, conditional_branches,
+                    exec_branches, ?structured_sites, ?unconditional_lane_sites,
+                    "rejected compute native requirements");
+            }
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -269,6 +326,22 @@ pub(crate) fn note_drop(this: This) {
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_compute_rejection(list: &crate::host::HostList, this: This, reason: &str) {
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !crate::host::indirect_argument_trace_active()
+        || LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4096
+    {
+        return;
+    }
+    let shaders: Vec<&str> = if this.is_null() {
+        Vec::new()
+    } else {
+        pipeline(this).shaders.iter().map(|shader| shader.hash.as_str()).collect()
+    };
+    tracing::info!(list = ?std::ptr::from_ref(list), ?shaders, reason, "indirect chain compute rejected");
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
