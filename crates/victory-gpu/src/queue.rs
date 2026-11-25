@@ -273,7 +273,8 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
-        if crate::capture::listed(frame) {
+        crate::capture::presented(frame);
+    if crate::capture::listed(frame) || (!crate::capture::auto_pending() && crate::capture::has_targets()) {
             crate::capture::dump_targets(frame);
         }
     }
