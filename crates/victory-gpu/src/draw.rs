@@ -1854,6 +1854,7 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        let alias_mark = list.mark_indirect_alias_check();
         #[cfg(feature = "diagnostics")]
         if kind == DISPATCH {
             list.begin_dispatch_trace();
@@ -1905,16 +1906,25 @@ impl State {
         } else {
             Vec::new()
         };
-        list.buffer_state(&args.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if let Some((shadow, _)) = &counter {
-            list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
-        }
+        let Some((argument_buffer, argument_offset)) = list.indirect_read(alias_mark, &args.buffer, args.offset(arguments), len) else {
+            why("could not snapshot indirect arguments");
+            return false;
+        };
+        let count_read = if let Some((shadow, address)) = &counter {
+            let Some(read) = list.indirect_read(alias_mark, &shadow.buffer, shadow.offset(*address), 4) else {
+                why("could not snapshot indirect count");
+                return false;
+            };
+            Some(read)
+        } else {
+            None
+        };
         #[cfg(feature = "diagnostics")]
         if let Some(&(_, frame, index)) = snapshots.first() {
-            list.snapshot_indirect(&args.buffer, args.offset(arguments), 12,
+            list.snapshot_indirect(&argument_buffer, argument_offset, 12.min(len),
                 D3D12_RESOURCE_STATE_GENERIC_READ, format!("dispatch-{frame}-{index}-groups-{arguments:x}"));
-            if let Some((shadow, address)) = &counter {
-                list.snapshot_indirect(&shadow.buffer, shadow.offset(*address), 4, D3D12_RESOURCE_STATE_GENERIC_READ,
+            if let (Some((buffer, offset)), Some((_, address))) = (&count_read, &counter) {
+                list.snapshot_indirect(buffer, *offset, 4, D3D12_RESOURCE_STATE_GENERIC_READ,
                     format!("dispatch-{frame}-{index}-count-{address:x}"));
             }
         }
@@ -1926,10 +1936,10 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                &argument_buffer,
+                argument_offset,
+                count_read.as_ref().map(|(buffer, _)| buffer),
+                count_read.as_ref().map_or(0, |(_, offset)| *offset),
             )
         };
         #[cfg(feature = "diagnostics")]
@@ -1937,9 +1947,9 @@ impl State {
         // A listed frame: what the records held (after the clamp).
         #[cfg(feature = "diagnostics")]
         if crate::capture::dump_on() {
-            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let count = count_read.as_ref().map(|(buffer, offset)| (buffer, *offset));
             let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+            crate::capture::read_indirect(list, (&argument_buffer, argument_offset), count, (kind, stride, max), name);
         }
         if kind == DISPATCH {
             #[cfg(feature = "diagnostics")]

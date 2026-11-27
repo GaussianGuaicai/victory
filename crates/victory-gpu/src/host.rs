@@ -1343,6 +1343,39 @@ pub(crate) fn trace_indirect_argument(address: u64) {
 }
 
 impl HostList {
+    pub(crate) fn mark_indirect_alias_check(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
+    pub(crate) fn indirect_read(
+        &self, mark: usize, buffer: &ID3D12Resource, offset: u64, bytes: u64,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let aliases = self.deferred().copies.iter().skip(mark).any(|step| {
+            matches!(step, Step::GpuWrite(shadow, ..) if shadow.buffer.as_raw() == buffer.as_raw())
+        });
+        if !aliases {
+            self.buffer_state(buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+            return Some((buffer.clone(), offset));
+        }
+        let snapshot = host()?.default_buffer_in(bytes, D3D12_RESOURCE_STATE_COMMON)?;
+        self.buffer_state(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        self.buffer_state(&snapshot, D3D12_RESOURCE_STATE_COPY_DEST);
+        unsafe { self.list.CopyBufferRegion(&snapshot, 0, buffer, offset, bytes) };
+        self.buffer_state(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        self.buffer_state(&snapshot, D3D12_RESOURCE_STATE_GENERIC_READ);
+        #[cfg(feature = "diagnostics")]
+        {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static LOGGED: AtomicU32 = AtomicU32::new(0);
+            if *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TRACE_BUFFER_ALIAS").is_some())
+                && LOGGED.fetch_add(1, Ordering::Relaxed) < 32
+            {
+                tracing::info!(offset, bytes, "snapshotted indirect read sharing a host UAV buffer");
+            }
+        }
+        Some((snapshot, 0))
+    }
+
     #[cfg(feature = "diagnostics")]
     pub(crate) fn mark_argument_writer(&self) -> Option<usize> {
         (INDIRECT_ARGUMENTS_ACTIVE.load(Ordering::Relaxed) != 0).then(|| self.deferred().copies.len())
