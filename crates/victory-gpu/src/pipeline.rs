@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -95,6 +97,13 @@ impl Shader {
             translated: OnceLock::new(),
         }
     }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn for_test(stage: &'static str, translated: Translated) -> Arc<Shader> {
+        let shader = Shader::new(stage, b"");
+        let _ = shader.translated.set(Some(translated));
+        Arc::new(shader)
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -106,63 +115,6 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn trace_compute_requirements(&self) {
-        use victory_shader::{Container, FourCC};
-        let Ok(container) = Container::parse(&self.container) else { return };
-        let Some(part) = container.part(FourCC::DXIL) else { return };
-        let Ok(programs) = victory_shader::native_programs(part.data) else { return };
-        for program in programs {
-            if let victory_shader::native::StageIo::Cs(compute) = program.io {
-                let Ok(instructions) = victory_shader::gfx10::decode(&program.code) else { continue };
-                let mut lane_ops = Vec::new();
-                let mut lane_sites = Vec::new();
-                let mut conditional_branches = 0;
-                let mut exec_branches = 0;
-                for (ordinal, name) in instructions.iter().enumerate()
-                    .filter_map(|(ordinal, instruction)| Some((ordinal, instruction.name()?)))
-                {
-                    conditional_branches += usize::from(name.starts_with("s_cbranch"));
-                    exec_branches += usize::from(name.starts_with("s_cbranch_exec"));
-                    if name.starts_with("ds_swizzle") || name.contains("permute")
-                        || name.starts_with("v_mbcnt") || matches!(name, "v_readlane_b32" | "v_writelane_b32")
-                    {
-                        lane_ops.push(name);
-                        if lane_sites.len() < 24 {
-                            lane_sites.push((ordinal, name, conditional_branches, exec_branches));
-                        }
-                    }
-                }
-                lane_ops.sort_unstable();
-                lane_ops.dedup();
-                let structured_sites = victory_shader::ir::build(
-                    &program.patched_code(), program.wave64, program.vgprs,
-                ).ok().and_then(|ir| {
-                    let structured = victory_shader::structure::structure(&ir).ok()?;
-                    let mut counts = [0usize; 2];
-                    let entry_blocks = structured.unconditional_entry_blocks();
-                    let mut unconditional_lane_sites = 0;
-                    for (block, instructions) in ir.blocks.iter().enumerate() {
-                        for (index, instruction) in instructions.insts.iter().enumerate() {
-                            if lane_ops.contains(&instruction.name()) {
-                                let guarded = structured.guards[block][index].is_some();
-                                counts[usize::from(guarded)] += 1;
-                                unconditional_lane_sites += usize::from(entry_blocks[block] && !guarded);
-                            }
-                        }
-                    }
-                    Some((counts, unconditional_lane_sites))
-                });
-                let unconditional_lane_sites = structured_sites.map(|(_, count)| count);
-                let structured_sites = structured_sites.map(|(counts, _)| counts);
-                tracing::info!(shader = %self.hash, wave64 = program.wave64, threads = ?compute.threads,
-                    lds_bytes = compute.lds_bytes(), ?lane_ops, ?lane_sites, conditional_branches,
-                    exec_branches, ?structured_sites, ?unconditional_lane_sites,
-                    "rejected compute native requirements");
-            }
-        }
-    }
-
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -293,9 +245,9 @@ pub(crate) fn bound(this: This) {
     }
 }
 
-/// The host pipeline of a title pipeline; `None` if one of its shaders does
-/// not translate, the host refuses it, or it is still being made (its first
-/// use starts that, see [`make`]).
+/// The host pipeline of a title pipeline; `None` if it is skipped, one of its
+/// shaders does not translate, the host refuses it, or it is still being made
+/// (its first use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
@@ -316,7 +268,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(feature = "diagnostics", any(windows, test)))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -337,16 +289,20 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
@@ -354,7 +310,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && pipeline(this).host.skipped_shader.is_some()
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
@@ -374,29 +330,15 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
+        p.host
+            .skipped_shader
+            .as_deref()
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
         note_why(why);
     }
-}
-
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn trace_compute_rejection(list: &crate::host::HostList, this: This, reason: &str) {
-    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if !crate::host::indirect_argument_trace_active()
-        || LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4096
-    {
-        return;
-    }
-    let shaders: Vec<&str> = if this.is_null() {
-        Vec::new()
-    } else {
-        pipeline(this).shaders.iter().map(|shader| shader.hash.as_str()).collect()
-    };
-    tracing::info!(list = ?std::ptr::from_ref(list), ?shaders, reason, "indirect chain compute rejected");
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -437,7 +379,12 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = Arc::new(make::Pending::new(
+        shaders.clone(),
+        graphics,
+        #[cfg(feature = "diagnostics")]
+        skip_hashes(),
+    ));
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -602,9 +549,10 @@ fn read_stream(
             break;
         }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*stream.as_ptr().add(at + 8).cast::<Bytecode>() };
-            shaders.extend(shader(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, which the
+            // slice does not promise to be aligned.
+            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -639,6 +587,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_uav_tests;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
@@ -757,7 +707,7 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -769,6 +719,25 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The slice a title's stream (or a pre-build's) is in need not be
+    /// 8-aligned: its bytecode is read as it lies.
+    #[test]
+    fn a_stream_of_any_alignment_is_read() {
+        let mut backing = [0u64; 5];
+        // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
+        stream[8..16].copy_from_slice(&0x1000usize.to_le_bytes());
+        stream[16..24].copy_from_slice(&7usize.to_le_bytes());
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
+        let seen = std::cell::RefCell::new(Vec::new());
+        read_stream(stream, |stage, code| {
+            seen.borrow_mut().push((stage, code.code as usize, code.size));
+            None
+        });
+        assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -929,3 +898,6 @@ mod tests {
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
     }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;
