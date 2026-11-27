@@ -2557,6 +2557,10 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_in(size, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    fn default_buffer_in(&self, size: u64, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -2578,7 +2582,7 @@ impl Host {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                state,
                 None,
                 &mut buffer,
             )
@@ -3201,6 +3205,67 @@ fn shadow_buffer_states_chain_only_within_a_submission() {
     assert_eq!(buffer_prelude_state(&mut batch, 1, read, read), None);
     batch.clear();
     assert_eq!(buffer_prelude_state(&mut batch, 1, read, read), Some(D3D12_RESOURCE_STATE_COMMON));
+}
+
+#[test]
+fn shared_section_kernel_copy_reaches_gpu() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, VirtualAlloc2, FILE_MAP_WRITE, PAGE_READWRITE, PAGE_NOACCESS, SEC_RESERVE, MEM_COMMIT, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, VirtualAlloc};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let require_debug = cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+    let Some(host) = host() else {
+        assert!(!require_debug, "no D3D12 host for debug validation");
+        eprintln!("no D3D12 host; skipped");
+        return;
+    };
+    assert!(!require_debug || host.messages.is_some(), "no D3D12 debug message queue");
+    let section_size = if std::env::var_os("VICTORY_TEST_GPU_LARGE_SECTION").is_some() { 0x185c00000u64 } else { 65536 };
+    let section = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, (section_size >> 32) as u32, section_size as u32, std::ptr::null()) };
+    assert!(!section.is_null());
+    let placeholder = unsafe { VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), 65536, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+    assert!(!placeholder.is_null());
+    let view = unsafe { MapViewOfFile3(section, GetCurrentProcess(), placeholder, 0, 65536, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0) };
+    assert!(!view.Value.is_null());
+    assert!(!unsafe { VirtualAlloc(view.Value, 65536, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+    let count = std::env::var("VICTORY_TEST_GPU_SECTION_VIEWS")
+        .map(|value| value.parse::<usize>().expect("view count"))
+        .unwrap_or(0);
+    assert!(count <= 60_000);
+    let mut views = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = if section_size > 65536 { (index as u64 + 1) * 65536 } else { 0 };
+        let extra = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, 65536) };
+        assert!(!extra.Value.is_null());
+        views.push(extra);
+    }
+    eprintln!("created {} extra section views", views.len());
+    if let Some(extra) = views.pop() {
+        assert_ne!(unsafe { UnmapViewOfFile(extra) }, 0);
+        let offset = if section_size > 65536 { count as u64 * 65536 } else { 0 };
+        let replacement = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, 65536) };
+        assert!(!replacement.Value.is_null());
+        views.push(replacement);
+    }
+    let expected = [11u32, 22, 33];
+    unsafe { view.Value.cast::<[u32; 3]>().write(expected) };
+    let (source, input) = host.shared_buffer(12).expect("source buffer");
+    let (destination, output) = host.shared_buffer(12).expect("destination buffer");
+    assert!(read(view.Value.cast(), input, 12));
+    let list = host.new_list().expect("copy list");
+    list.buffer_state(&source, D3D12_RESOURCE_STATE_GENERIC_READ);
+    list.buffer_state(&destination, D3D12_RESOURCE_STATE_COPY_DEST);
+    unsafe {
+        list.list.CopyBufferRegion(&destination, 0, &source, 0, 12);
+        list.list.Close().expect("close copy list");
+    }
+    let error = host.execute_with_validation(&[&list]);
+    assert!(!require_debug || error.is_none(), "D3D12 submission error: {error:?}");
+    assert_eq!(unsafe { output.cast::<[u32; 3]>().read() }, expected);
+    for extra in views {
+        assert_ne!(unsafe { UnmapViewOfFile(extra) }, 0);
+    }
+    unsafe { UnmapViewOfFile(view); CloseHandle(section); }
 }
 
 #[test]
