@@ -948,6 +948,7 @@ fn refusal_message(
 /// are mapped again outside it. A failure does not undo earlier changes.
 fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
     unmap_with(physical, base, len, |at| {
+        // SAFETY: `at` is the base of a tracked view mapped over a placeholder in this process.
         let unmapped = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
@@ -1277,7 +1278,9 @@ mod tests {
         assert!(map_alias(alias as u64, 0, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
         for reservation in [source, alias] {
-            assert_ne!(unsafe { VirtualFree(reservation, 0, MEM_RELEASE) }, 0);
+            // SAFETY: These are the original reservation bases, restored to placeholders above.
+            let released = unsafe { VirtualFree(reservation, 0, MEM_RELEASE) };
+            assert_ne!(released, 0);
         }
     }
 
