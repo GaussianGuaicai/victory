@@ -812,11 +812,20 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| tracing::info!("physical page mapping observed"));
+    }
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
         victory_gpu::title_memory_aliased(base + k * PAGE, shown);
         shown.push(base + k * PAGE);
+        #[cfg(feature = "diagnostics")]
+        if shown.len() >= 16 && shown.len().is_power_of_two() {
+            tracing::info!(views = shown.len(), "physical page alias count");
+        }
     }
     physical.views.insert(base, (len, slice));
     true
@@ -1030,6 +1039,140 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_page_view_stress() {
+        let Ok(value) = std::env::var("VICTORY_TEST_PHYSICAL_VIEWS") else {
+            return;
+        };
+        let count: usize = value.parse().expect("view count");
+        assert!(count > 0 && count <= 100_000);
+        let section_pages: usize = std::env::var("VICTORY_TEST_PHYSICAL_SECTION_PAGES")
+            .map(|value| value.parse().expect("section page count"))
+            .unwrap_or(count);
+        assert!(section_pages >= count && section_pages <= 100_000);
+        let mut pages = vec![0usize; section_pages];
+        let mut allocated = section_pages;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut allocated, pages.as_mut_ptr()), 1);
+        assert_eq!(allocated, section_pages);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(), count * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let aliases = std::env::var_os("VICTORY_TEST_PHYSICAL_ALIASES").is_some();
+        let unique = if std::env::var_os("VICTORY_TEST_PHYSICAL_SINGLE_PAGE").is_some() {
+            1
+        } else if aliases {
+            count.div_ceil(2)
+        } else {
+            count
+        };
+        let started = std::time::Instant::now();
+        for index in 0..count {
+            let address = base.wrapping_byte_add(index * PAGE);
+            assert_eq!(XMemMapPhysicalPages(address, 1, &pages[index % unique]), address, "page {index}");
+            if index < unique {
+                unsafe { address.cast::<u8>().write((index % 251) as u8) };
+            } else {
+                assert_eq!(unsafe { address.cast::<u8>().read() }, ((index % unique) % 251) as u8);
+            }
+        }
+        eprintln!("created {count} views in {:?}", started.elapsed());
+        if std::env::var_os("VICTORY_TEST_PHYSICAL_REMAP").is_some() {
+            let started = std::time::Instant::now();
+            for index in 0..count {
+                let address = base.wrapping_byte_add(index * PAGE);
+                assert_eq!(XMemMapPhysicalPages(address, 1, std::ptr::null()), address);
+                assert_eq!(XMemMapPhysicalPages(address, 1, &pages[index % unique]), address);
+                assert_eq!(unsafe { address.cast::<u8>().read() }, ((index % unique) % 251) as u8);
+            }
+            eprintln!("remapped {count} views in {:?}", started.elapsed());
+        }
+        if std::env::var_os("VICTORY_TEST_PHYSICAL_THREADS").is_some() {
+            let base_address = base as usize;
+            std::thread::scope(|scope| {
+                for worker in 0..4 {
+                    let pages = &pages;
+                    scope.spawn(move || {
+                        for index in (worker..count).step_by(4) {
+                            let address = (base_address + index * PAGE) as *mut c_void;
+                            assert_eq!(XMemMapPhysicalPages(address, 1, std::ptr::null()), address);
+                            assert_eq!(XMemMapPhysicalPages(address, 1, &pages[index % unique]), address);
+                            assert_eq!(unsafe { address.cast::<u8>().read() }, ((index % unique) % 251) as u8);
+                        }
+                    });
+                }
+            });
+        }
+        if std::env::var_os("VICTORY_TEST_PHYSICAL_READ_RACE").is_some() {
+            use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+            let base_address = base as usize;
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let mut data = [0u8; 4096];
+                    let mut completed = 0usize;
+                    barrier.wait();
+                    for iteration in 0..count {
+                        let address = base_address + (iteration % count) * PAGE;
+                        let mut copied = 0;
+                        let ok = unsafe {
+                            ReadProcessMemory(GetCurrentProcess(), address as *const _, data.as_mut_ptr().cast(), data.len(), &mut copied)
+                        };
+                        if ok != 0 {
+                            assert_eq!(copied, data.len());
+                            completed += 1;
+                        }
+                    }
+                    assert!(completed > 0);
+                    eprintln!("completed {completed} concurrent kernel reads");
+                });
+                barrier.wait();
+                for index in 0..count {
+                    let address = (base_address + index * PAGE) as *mut c_void;
+                    assert_eq!(XMemMapPhysicalPages(address, 1, std::ptr::null()), address);
+                    assert_eq!(XMemMapPhysicalPages(address, 1, &pages[index % unique]), address);
+                }
+            });
+        }
+        if std::env::var_os("VICTORY_TEST_PHYSICAL_READ_HANDSHAKE").is_some() {
+            use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+            let base_address = base as usize;
+            let (request, requests) = std::sync::mpsc::sync_channel::<()>(0);
+            let (response, responses) = std::sync::mpsc::sync_channel::<()>(0);
+            std::thread::scope(move |scope| {
+                scope.spawn(move || {
+                    let mut data = [0u8; 4096];
+                    for index in 0..count {
+                        let address = (base_address + index * PAGE) as *const c_void;
+                        requests.recv().expect("unmapped read request");
+                        let mut copied = 0;
+                        let result = unsafe { ReadProcessMemory(GetCurrentProcess(), address, data.as_mut_ptr().cast(), data.len(), &mut copied) };
+                        assert_eq!(result, 0, "unmapped page {index}");
+                        response.send(()).expect("unmapped read response");
+                        requests.recv().expect("remapped read request");
+                        let result = unsafe { ReadProcessMemory(GetCurrentProcess(), address, data.as_mut_ptr().cast(), data.len(), &mut copied) };
+                        assert_ne!(result, 0, "remapped page {index}");
+                        assert_eq!(copied, data.len());
+                        assert_eq!(data[0], ((index % unique) % 251) as u8);
+                        response.send(()).expect("remapped read response");
+                    }
+                });
+                for index in 0..count {
+                    let address = (base_address + index * PAGE) as *mut c_void;
+                    assert_eq!(XMemMapPhysicalPages(address, 1, std::ptr::null()), address);
+                    request.send(()).expect("unmapped read request");
+                    responses.recv().expect("unmapped read response");
+                    assert_eq!(XMemMapPhysicalPages(address, 1, &pages[index % unique]), address);
+                    request.send(()).expect("remapped read request");
+                    responses.recv().expect("remapped read response");
+                }
+                drop(request);
+            });
+            eprintln!("verified {count} unmapped and remapped kernel reads");
+        }
+        eprintln!("mapped {count} physical page views");
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
