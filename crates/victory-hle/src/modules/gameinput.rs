@@ -439,6 +439,14 @@ impl Hub {
             #[cfg(any(test, feature = "diagnostics"))]
             {
                 let scripted = source.scripted_keys();
+                #[cfg(feature = "diagnostics")]
+                {
+                    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    let active = !scripted.is_empty();
+                    if ACTIVE.swap(active, std::sync::atomic::Ordering::Relaxed) != active {
+                        tracing::info!(active, keys = ?scripted.iter().map(|key| key.virtual_key).collect::<Vec<_>>(), pad_connected = pads.iter().any(Option::is_some), "scripted input polled");
+                    }
+                }
                 merge_scripted(&mut pads, &scripted);
             }
             #[cfg(not(any(test, feature = "diagnostics")))]
